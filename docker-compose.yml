@@ -1,0 +1,103 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: csi_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-csi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-csi_password}
+      POSTGRES_DB: ${POSTGRES_DB:-csi_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-csi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis/redis-stack:latest
+    container_name: csi_redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    image: csi_app:dev
+    container_name: csi_app
+    env_file:
+      - .env
+    volumes:
+      - ./:/usr/src/app
+    depends_on:
+      - postgres
+      - redis
+    command: ["npm", "run", "api"]
+    ports:
+      - "${API_PORT:-3000}:3000"
+
+  worker:
+    image: csi_app:dev
+    container_name: csi_worker
+    env_file:
+      - .env
+    volumes:
+      - ./:/usr/src/app
+    depends_on:
+      - postgres
+      - redis
+    command: ["npm", "run", "worker"]
+
+  websocket:
+    image: csi_app:dev
+    container_name: csi_ws
+    env_file:
+      - .env
+    volumes:
+      - ./:/usr/src/app
+    depends_on:
+      - redis
+    command: ["npm", "run", "ws"]
+    ports:
+      - "${WS_PORT:-3001}:3001"
+
+  frontend-dev:
+    image: csi_app:dev
+    container_name: csi_frontend_dev
+    env_file:
+      - .env
+    volumes:
+      - ./:/usr/src/app
+    command: ["npm", "run", "frontend:stub"]
+    ports:
+      - "${FRONTEND_PORT:-3002}:3002"
+
+  pgadmin:
+    image: dpage/pgadmin4:6.21
+    container_name: csi_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION: 'False'
+      PGADMIN_CONFIG_WTF_CSRF_ENABLED: 'False'
+      PGADMIN_CONFIG_WTF_CSRF_CHECK_DEFAULT: 'False'
+      PGADMIN_DISABLE_POSTFIX: 'true'
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  pg_data:
+  pgadmin_data:

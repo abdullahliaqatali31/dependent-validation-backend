@@ -1,0 +1,43 @@
+{
+  "name": "csi-centralized-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "api": "ts-node-dev --respawn --transpile-only src/api/index.ts",
+    "worker": "ts-node-dev --respawn --transpile-only src/workers/runAll.ts",
+    "ws": "ts-node-dev --respawn --transpile-only src/ws/server.ts",
+    "frontend:stub": "ts-node-dev --respawn --transpile-only src/frontend-stub.ts",
+    "migrate": "ts-node-dev --transpile-only src/migrate.ts",
+    "seed:public": "ts-node-dev --transpile-only src/scripts/seedPublicDomains.ts",
+    "seed:pythonRules": "ts-node-dev --transpile-only src/scripts/seedPythonRules.ts",
+    "export:pythonRules": "ts-node-dev --transpile-only src/scripts/exportRulesToPython.ts",
+    "sync:profiles": "ts-node-dev --transpile-only src/scripts/syncProfiles.ts",
+    "test:ninja": "ts-node-dev --transpile-only src/scripts/testNinja.ts",
+    "dev": "npm run api",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/api/index.js",
+    "test": "jest"
+  },
+  "dependencies": {
+    "bullmq": "^5.11.0",
+    "cors": "^2.8.5",
+    "csv-parse": "^5.5.2",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "@supabase/supabase-js": "^2.45.0",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.11.30",
+    "@types/pg": "^8.15.5",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.5"
+  }
+}
