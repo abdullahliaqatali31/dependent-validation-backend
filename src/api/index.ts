@@ -35,7 +35,14 @@ function getSupabaseUser(req: express.Request): { id?: string; role?: string } {
   try {
     const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8')) || {};
     const id = payload.sub || (payload.user && payload.user.id) || undefined;
-    const role = (payload.app_metadata && payload.app_metadata.role) || (payload.user_metadata && payload.user_metadata.role) || undefined;
+    const am = (payload.app_metadata as any) || {};
+    const um = (payload.user_metadata as any) || {};
+    let role: string | undefined = undefined;
+    if (typeof am.role === 'string') role = am.role;
+    else if (typeof um.role === 'string') role = um.role;
+    else if (Array.isArray(am.roles) && am.roles.includes('admin')) role = 'admin';
+    else if (Array.isArray(um.roles) && um.roles.includes('admin')) role = 'admin';
+    else if (am.is_admin === true || um.is_admin === true) role = 'admin';
     return { id, role };
   } catch {
     return {};
