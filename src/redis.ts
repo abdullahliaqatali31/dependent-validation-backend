@@ -3,7 +3,7 @@ import { config } from './config';
 
 export const redis = new Redis(config.redisUrl);
 
-export async function bloomExists(key: string, item: string): Promise<boolean> {
+ export async function bloomExists(key: string, item: string): Promise<boolean> {
   try {
     const res = await redis.call('BF.EXISTS', key, item) as number;
     return res === 1;
