@@ -40,9 +40,9 @@ function getSupabaseUser(req: express.Request): { id?: string; role?: string } {
     let role: string | undefined = undefined;
     if (typeof am.role === 'string') role = am.role;
     else if (typeof um.role === 'string') role = um.role;
-    else if (Array.isArray(am.roles) && am.roles.includes('admin')) role = 'admin';
-    else if (Array.isArray(um.roles) && um.roles.includes('admin')) role = 'admin';
-    else if (am.is_admin === true || um.is_admin === true) role = 'admin';
+    else if (Array.isArray(am.roles) && am.roles.some((r: any) => String(r || '').toLowerCase() === 'admin')) role = 'admin';
+    else if (Array.isArray(um.roles) && um.roles.some((r: any) => String(r || '').toLowerCase() === 'admin')) role = 'admin';
+    else if (am.is_admin === true || um.is_admin === true || am.isAdmin === true || um.isAdmin === true || am.admin === true || um.admin === true) role = 'admin';
     return { id, role };
   } catch {
     return {};
