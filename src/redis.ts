@@ -4,13 +4,18 @@ import { config } from './config';
 export const redis = new Redis(config.redisUrl);
 
 export async function bloomExists(key: string, item: string): Promise<boolean> {
-  // RedisBloom BF.EXISTS
-  const res = await redis.call('BF.EXISTS', key, item) as number;
-  return res === 1;
+  try {
+    const res = await redis.call('BF.EXISTS', key, item) as number;
+    return res === 1;
+  } catch {
+    return false;
+  }
 }
 
 export async function bloomAdd(key: string, item: string): Promise<void> {
-  await redis.call('BF.ADD', key, item);
+  try {
+    await redis.call('BF.ADD', key, item);
+  } catch {}
 }
 
 export async function publish(channel: string, message: any) {
