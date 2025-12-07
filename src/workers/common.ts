@@ -13,5 +13,8 @@ export function defaultWorkerOptions(redisUrl: string): WorkerOptions {
     connection: {
       url: redisUrl
     }
+    , lockDuration: 300000
+    , stalledInterval: 30000
+    , maxStalledCount: 10
   };
 }

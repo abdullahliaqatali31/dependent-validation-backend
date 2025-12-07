@@ -85,10 +85,10 @@ async function processMaster(masterId: number) {
   try {
     const idx = await assignWorkerForBatch(batchId);
     const q = validationQueues[idx] || validationQueues[0];
-    await q.add('validateEmail', { masterId }, { removeOnComplete: true, removeOnFail: true });
+    await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false });
   } catch {
     const q = validationQueues[0] || undefined;
-    if (q) await q.add('validateEmail', { masterId }, { removeOnComplete: true, removeOnFail: true });
+    if (q) await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false });
   }
 }
 

@@ -3,6 +3,7 @@ import { config } from '../config'
 
 const BATCH_WORKER_KEY = (batchId: number) => `val:batch:${batchId}:worker_idx`
 const WORKER_BATCH_KEY = (idx: number) => `val:worker:${idx}:batch_id`
+const WORKER_BATCH_TS = (idx: number) => `val:worker:${idx}:batch_ts`
 
 export async function assignWorkerForBatch(batchId: number): Promise<number> {
   const existing = await redis.get(BATCH_WORKER_KEY(batchId))
@@ -13,6 +14,7 @@ export async function assignWorkerForBatch(batchId: number): Promise<number> {
     if (!cur) {
       await redis.set(BATCH_WORKER_KEY(batchId), String(idx))
       await redis.set(WORKER_BATCH_KEY(idx), String(batchId))
+      await redis.set(WORKER_BATCH_TS(idx), String(Date.now()))
       return idx
     }
   }
@@ -27,6 +29,6 @@ export async function releaseBatchAssignment(batchId: number): Promise<void> {
   if (existing) {
     await redis.del(BATCH_WORKER_KEY(batchId))
     await redis.del(WORKER_BATCH_KEY(Number(existing)))
+    await redis.del(WORKER_BATCH_TS(Number(existing)))
   }
 }
-

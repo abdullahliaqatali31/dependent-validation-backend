@@ -3,7 +3,7 @@ import { defaultWorkerOptions } from './common'
 import { config } from '../config'
 import { query } from '../db'
 import { redis, publish, CHANNELS } from '../redis'
-import { QUEUE_NAMES, personalQueue } from '../queues'
+import { QUEUE_NAMES, personalQueue, validationQueues } from '../queues'
 import { releaseBatchAssignment } from '../utils/validationAssignment'
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
@@ -111,11 +111,46 @@ async function processJob(masterId: number, key: string, workerId: string) {
 const workers: Worker[] = []
 config.ninjaKeys.forEach((k, idx) => {
   const w = new Worker(`${QUEUE_NAMES.validation}_${idx}`, async (job: Job) => {
-    const { masterId } = job.data as { masterId: number }
-    await processJob(masterId, k, `val-${idx}`)
+    try {
+      const { masterId } = job.data as { masterId: number }
+      await processJob(masterId, k, `val-${idx}`)
+    } catch (e) {
+      try { await publish(CHANNELS.systemMonitor, { type: 'worker_error', worker: `validation_${idx}`, error: (e as any)?.message || String(e) }) } catch {}
+      console.error(e)
+      throw e
+    }
   }, { ...defaultWorkerOptions(config.redisUrl), concurrency: 1 })
   workers.push(w)
   ;(async () => { while (true) { await heartbeat(`val-${idx}`, k); await sleep(5000) } })()
 })
 
 console.log('validationMulti workers started')
+;(async () => {
+  while (true) {
+    try {
+      const total = (config.ninjaKeys || []).length
+      const now = Date.now()
+      for (let idx = 0; idx < total; idx++) {
+        const hb = await redis.hget(`worker:val-${idx}:status`, 'lastHeartbeat')
+        const hbTs = hb ? Number(hb) : 0
+        const batchIdStr = await redis.get(`val:worker:${idx}:batch_id`)
+        const batchTsStr = await redis.get(`val:worker:${idx}:batch_ts`)
+        const batchTs = batchTsStr ? Number(batchTsStr) : 0
+        const stale = (hbTs && now - hbTs > 10 * 60 * 1000) || (batchTs && now - batchTs > 10 * 60 * 1000)
+        if (batchIdStr && stale) {
+          const batchId = Number(batchIdStr)
+          await releaseBatchAssignment(batchId)
+          const pending = await query<{ id: number }>(
+            'SELECT me.id FROM master_emails me WHERE me.batch_id=$1 AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id) LIMIT 1000',
+            [batchId]
+          )
+          for (const row of pending.rows) {
+            const q = validationQueues[idx] || validationQueues[0]
+            if (q) await q.add('validateEmail', { masterId: row.id }, { removeOnComplete: false, removeOnFail: false })
+          }
+        }
+      }
+    } catch (e) { console.error(e) }
+    await sleep(30000)
+  }
+})()
