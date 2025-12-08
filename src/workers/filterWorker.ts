@@ -98,7 +98,7 @@ export const filterWorker = new Worker(
     const { masterId } = job.data as { masterId: number };
     await processMaster(masterId);
   },
-  defaultWorkerOptions(config.redisUrl)
+  { ...defaultWorkerOptions(config.redisUrl), concurrency: 10 }
 );
 
 console.log('filterWorker started');
