@@ -86,10 +86,10 @@ async function processMaster(masterId: number) {
     await ensureBatchActivated(batchId);
     const idx = await assignWorkerRoundRobin(batchId);
     const q = validationQueues[idx] || validationQueues[0];
-    await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: false, removeOnFail: false });
+    await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: true, removeOnFail: true });
   } catch {
     const q = validationQueues[0] || undefined;
-    if (q) await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: false, removeOnFail: false });
+    if (q) await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: true, removeOnFail: true });
   }
 }
 
