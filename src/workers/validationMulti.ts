@@ -53,11 +53,20 @@ function mapOutcome(message: string, code?: string): 'accepted' | 'catch_all' | 
   return 'rejected'
 }
 
-async function processJob(masterId: number, key: string, workerId: string) {
+async function processJob(masterId: number, key: string, workerId: string, workerIdx: number) {
   const m = await query<{ email_normalized: string; batch_id: number; domain: string | null }>('SELECT email_normalized, batch_id, domain FROM master_emails WHERE id=$1', [masterId])
   if (m.rows.length === 0) return
   const email = m.rows[0].email_normalized
   const batchId = m.rows[0].batch_id
+  const b = await query<{ status: string; paused_stage: string | null }>('SELECT status, paused_stage FROM batches WHERE batch_id=$1', [batchId])
+  const paused = String(b.rows[0]?.status || '').toLowerCase() === 'paused'
+  const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase()
+  if (paused && pausedStage === 'validation') {
+    const q = validationQueues[workerIdx] || validationQueues[0]
+    try { await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}
+    await publish(CHANNELS.batchProgress, { batchId, stage: 'validation', status: 'paused', master_id: masterId })
+    return
+  }
   await heartbeat(workerId, key, `${batchId}:${email}`)
   try {
     const data = await verify(email, key)
@@ -79,8 +88,18 @@ async function processJob(masterId: number, key: string, workerId: string) {
     const category = isPersonal ? 'personal' : 'business'
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (master_id) DO NOTHING`,
       [masterId, status, JSON.stringify(data), key, domain, mx, message, JSON.stringify({ domain, mx, code }), category, outcome, isPersonal, !isPersonal]
+    )
+    await query(
+      `UPDATE ninja_keys
+       SET total_requests = total_requests + 1,
+           total_success = total_success + 1,
+           consecutive_errors = 0,
+           last_used_at = now()
+       WHERE key=$1`,
+      [key]
     )
     await redis.incr(`worker:${workerId}:req_today`)
     await redis.lpush('val_speed_points', Date.now().toString())
@@ -103,6 +122,17 @@ async function processJob(masterId: number, key: string, workerId: string) {
     } else {
       await sleep(500)
     }
+    try {
+      await query(
+        `UPDATE ninja_keys
+         SET total_requests = total_requests + 1,
+             total_failed = total_failed + 1,
+             consecutive_errors = consecutive_errors + 1,
+             last_used_at = now()
+         WHERE key=$1`,
+        [key]
+      )
+    } catch {}
   } finally {
     await heartbeat(workerId, key)
   }
@@ -113,7 +143,7 @@ config.ninjaKeys.forEach((k, idx) => {
   const w = new Worker(`${QUEUE_NAMES.validation}_${idx}`, async (job: Job) => {
     try {
       const { masterId } = job.data as { masterId: number }
-      await processJob(masterId, k, `val-${idx}`)
+      await processJob(masterId, k, `val-${idx}`, idx)
     } catch (e) {
       try { await publish(CHANNELS.systemMonitor, { type: 'worker_error', worker: `validation_${idx}`, error: (e as any)?.message || String(e) }) } catch {}
       console.error(e)
@@ -146,7 +176,7 @@ console.log('validationMulti workers started')
           )
           for (const row of pending.rows) {
             const q = validationQueues[idx] || validationQueues[0]
-            if (q) await q.add('validateEmail', { masterId: row.id }, { removeOnComplete: false, removeOnFail: false })
+            if (q) await q.add('validateEmail', { masterId: row.id }, { jobId: String(row.id), removeOnComplete: false, removeOnFail: false })
           }
         }
       }

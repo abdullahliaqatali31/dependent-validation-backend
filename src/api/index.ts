@@ -3,7 +3,7 @@ import cors from 'cors';
 import { config } from '../config';
 import { query } from '../db';
 import { dedupeQueue, filterQueue } from '../queues';
-import { personalQueue, validationQueue } from '../queues';
+import { personalQueue, validationQueue, validationQueues, QUEUE_NAMES } from '../queues';
 import { publish, CHANNELS, redis } from '../redis';
 import { createClient } from '@supabase/supabase-js';
 
@@ -162,7 +162,7 @@ app.get('/batches/:id/steps', async (req, res) => {
 
     res.json({
       upload: { processed: totalUploaded, total: totalUploaded },
-      dedupe: { processed: master, total: totalUploaded },
+      dedupe: { processed: master, total: staged + master },
       filter: { processed: filtered, total: master },
       clean: { processed: cleaned, total: master },
       validation: { processed: validated, total: passedFilter },
@@ -1595,6 +1595,20 @@ app.post('/admin/keys/refresh', async (_req, res) => {
   }
 });
 
+app.post('/admin/keys/recount', async (_req, res) => {
+  try {
+    const totals = await query<{ key: string; c: string }>(
+      `SELECT ninja_key_used AS key, COUNT(*) AS c FROM validation_results WHERE ninja_key_used IS NOT NULL GROUP BY ninja_key_used`
+    );
+    for (const r of totals.rows) {
+      await query('UPDATE ninja_keys SET total_requests=$2, total_success=$2 WHERE key=$1', [r.key, Number(r.c || 0)]);
+    }
+    res.json({ ok: true, updated: totals.rowCount });
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_keys_recount_failed', details: err.message });
+  }
+});
+
 app.post('/admin/keys/:id/activate', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -1665,6 +1679,36 @@ app.get('/admin/system/speed', async (_req, res) => {
   }
 });
 
+// Admin: queue stats (waiting, active, delayed, completed, failed)
+app.get('/admin/queues/stats', async (_req, res) => {
+  try {
+    const list: { name: string; q: any }[] = [
+      { name: QUEUE_NAMES.dedupe, q: dedupeQueue },
+      { name: QUEUE_NAMES.filter, q: filterQueue },
+      { name: QUEUE_NAMES.personal, q: personalQueue },
+      { name: QUEUE_NAMES.validation, q: validationQueue },
+      ...validationQueues.map((q, i) => ({ name: `${QUEUE_NAMES.validation}_${i}`, q }))
+    ];
+    const stats = [] as any[];
+    for (const { name, q } of list) {
+      try {
+        const c = await q.getJobCounts('waiting','active','delayed','completed','failed');
+        stats.push({ name, ...c });
+      } catch (e: any) {
+        stats.push({ name, error: e?.message || 'failed' });
+      }
+    }
+    const validationAll = stats.filter(s => String(s.name).startsWith(`${QUEUE_NAMES.validation}_`));
+    if (validationAll.length > 0) {
+      const sum = (k: string) => validationAll.reduce((acc, s) => acc + Number((s as any)[k] || 0), 0);
+      stats.unshift({ name: 'validation_all', waiting: sum('waiting'), active: sum('active'), delayed: sum('delayed'), completed: sum('completed'), failed: sum('failed') });
+    }
+    res.json(stats);
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_queues_stats_failed', details: err.message });
+  }
+});
+
 // Enqueue pending validation jobs (useful when a new batch appears not validating yet)
 app.post('/admin/validation/enqueue', async (req, res) => {
   if (!requireAdmin(req, res)) return;
@@ -1687,7 +1731,11 @@ app.post('/admin/validation/enqueue', async (req, res) => {
       try {
         const m = await query<{ batch_id: number }>('SELECT batch_id FROM master_emails WHERE id=$1', [r.id]);
         const bid = Number(m.rows[0]?.batch_id || 0);
-        const idx = bid ? await (await import('../utils/validationAssignment')).assignWorkerForBatch(bid) : 0;
+        if (bid) {
+          const va = await import('../utils/validationAssignment')
+          await va.ensureBatchActivated(bid)
+        }
+        const idx = bid ? await (await import('../utils/validationAssignment')).assignWorkerRoundRobin(bid) : 0;
         const queuesMod = await import('../queues');
         const qArr = (queuesMod as any).validationQueues as any[];
         const q = qArr[idx] || qArr[0];
@@ -1736,6 +1784,9 @@ app.delete('/batches/:id', async (req, res) => {
     await removeJobs(filterQueue, ['waiting','delayed'], (j) => masterIds.has(Number(j?.data?.masterId)));
     await removeJobs(personalQueue, ['waiting','delayed'], (j) => masterIds.has(Number(j?.data?.masterId)));
     await removeJobs(validationQueue, ['waiting','delayed'], (j) => masterIds.has(Number(j?.data?.masterId)));
+    for (const vq of validationQueues) {
+      await removeJobs(vq, ['waiting','delayed'], (j) => masterIds.has(Number(j?.data?.masterId)));
+    }
 
     await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [id, 'deleted']);
 
@@ -1754,6 +1805,10 @@ app.delete('/batches/:id', async (req, res) => {
     await query('COMMIT');
 
     await publish(CHANNELS.batchProgress, { type: 'batch_deleted', batchId: id });
+    try {
+      const { releaseBatchAssignment } = await import('../utils/validationAssignment');
+      await releaseBatchAssignment(id);
+    } catch {}
     await query('INSERT INTO audit_logs(action_type, actor_id, resource_ref, details) VALUES ($1, $2, $3, $4)', ['batch_deleted', 0, String(id), JSON.stringify({ deleted_by: actorUuid })]);
     res.json({ success: true, message: 'Batch deleted', batch_id: id });
   } catch (err: any) {

@@ -116,8 +116,18 @@ async function validateMaster(masterId: number) {
     const category = isPersonal ? 'personal' : 'business';
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (master_id) DO NOTHING`,
       [masterId, resp.status, JSON.stringify(details), key, domain, mx, message, JSON.stringify({ domain, mx, code: (resp as any)?.detail?.code }), category, outcome, isPersonal, !isPersonal]
+    );
+    await query(
+      `UPDATE ninja_keys
+       SET total_requests = total_requests + 1,
+           total_success = total_success + 1,
+           consecutive_errors = 0,
+           last_used_at = now()
+       WHERE key=$1`,
+      [key]
     );
     // Publish progress for validation stage (simple per-email update)
     try {
@@ -133,6 +143,17 @@ async function validateMaster(masterId: number) {
       await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: false, removeOnFail: false });
     } catch {}
   } catch (e) {
+    try {
+      await query(
+        `UPDATE ninja_keys
+         SET total_requests = total_requests + 1,
+             total_failed = total_failed + 1,
+             consecutive_errors = consecutive_errors + 1,
+             last_used_at = now()
+         WHERE key=$1`,
+        [key]
+      );
+    } catch {}
     try {
       await query('INSERT INTO audit_logs(action_type, details, resource_ref) VALUES ($1, $2, $3)', [
         'validation_error',

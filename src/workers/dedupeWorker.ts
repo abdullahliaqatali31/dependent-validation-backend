@@ -19,7 +19,6 @@ async function processBatch(batchId: number) {
   const submitter_team_id = (b.rows[0]?.submitter_team_id ?? null) as number | null;
   const totalQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails_temp WHERE batch_id=$1', [batchId]);
   const total = Number(totalQ.rows[0]?.c || 0);
-  let processedCount = 0;
 
   while (true) {
     const staged = await query<{ id: number; email_raw: string }>(
@@ -49,10 +48,15 @@ async function processBatch(batchId: number) {
     const maxId = staged.rows[staged.rows.length - 1].id;
     await query('DELETE FROM master_emails_temp WHERE batch_id=$1 AND id<= $2', [batchId, maxId]);
 
-    processedCount += staged.rows.length;
-    await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'dedupe', processed: processedCount, total });
+    const stagedCountQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails_temp WHERE batch_id=$1', [batchId]);
+    const masterCountQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails WHERE batch_id=$1', [batchId]);
+    const stagedCount = Number(stagedCountQ.rows[0]?.c || 0);
+    const masterCount = Number(masterCountQ.rows[0]?.c || 0);
+    await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'dedupe', processed: masterCount, total: stagedCount + masterCount });
   }
-  await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'dedupe_complete', processed: total, total });
+  const masterCountQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails WHERE batch_id=$1', [batchId]);
+  const masterCount = Number(masterCountQ.rows[0]?.c || 0);
+  await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'dedupe_complete', processed: masterCount, total: masterCount });
 }
 
 export const dedupeWorker = new Worker(

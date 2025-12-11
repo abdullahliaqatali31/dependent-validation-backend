@@ -6,7 +6,7 @@ import { matchRules } from '../utils/rules';
 import { cleanEmail } from '../utils/emailCleaner';
 import { isUnsubscribed } from '../utils/unsubscribeFilter';
 import { validationQueues } from '../queues';
-import { assignWorkerForBatch } from '../utils/validationAssignment';
+import { assignWorkerRoundRobin, ensureBatchActivated } from '../utils/validationAssignment';
 import { publish, CHANNELS } from '../redis';
 
 async function loadRulesFor(masterId: number) {
@@ -83,12 +83,13 @@ async function processMaster(masterId: number) {
   await publish(CHANNELS.batchProgress, { stage: 'filter', status: removed ? 'excluded' : 'passed', master_id: masterId });
   if (removed) return;
   try {
-    const idx = await assignWorkerForBatch(batchId);
+    await ensureBatchActivated(batchId);
+    const idx = await assignWorkerRoundRobin(batchId);
     const q = validationQueues[idx] || validationQueues[0];
-    await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false });
+    await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: false, removeOnFail: false });
   } catch {
     const q = validationQueues[0] || undefined;
-    if (q) await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false });
+    if (q) await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: false, removeOnFail: false });
   }
 }
 
