@@ -7,7 +7,7 @@ dotenv.config({ path: '.env.local', override: true });
 export const config = {
   databaseUrl: process.env.DATABASE_URL || 'postgres://csi:csi_password@localhost:5432/csi_db',
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
-  apiPort: Number(process.env.PORT || process.env.API_PORT || 3000),
+  apiPort: Number(process.env.API_PORT || 3000),
   wsPort: Number(process.env.WS_PORT || 3001),
   frontendPort: Number(process.env.FRONTEND_PORT || 3002),
   supabaseUrl: process.env.SUPABASE_URL || '',
