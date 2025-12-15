@@ -63,7 +63,7 @@ async function processJob(masterId: number, key: string, workerId: string, worke
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase()
   if (paused && pausedStage === 'validation') {
     const q = validationQueues[workerIdx] || validationQueues[0]
-    try { await q.add('validateEmail', { masterId }, { jobId: String(masterId), removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}
+    try { await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}
     await publish(CHANNELS.batchProgress, { batchId, stage: 'validation', status: 'paused', master_id: masterId })
     return
   }
@@ -88,8 +88,7 @@ async function processJob(masterId: number, key: string, workerId: string, worke
     const category = isPersonal ? 'personal' : 'business'
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       ON CONFLICT (master_id) DO NOTHING`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [masterId, status, JSON.stringify(data), key, domain, mx, message, JSON.stringify({ domain, mx, code }), category, outcome, isPersonal, !isPersonal]
     )
     await query(
@@ -176,7 +175,7 @@ console.log('validationMulti workers started')
           )
           for (const row of pending.rows) {
             const q = validationQueues[idx] || validationQueues[0]
-            if (q) await q.add('validateEmail', { masterId: row.id }, { jobId: String(row.id), removeOnComplete: false, removeOnFail: false })
+            if (q) await q.add('validateEmail', { masterId: row.id }, { removeOnComplete: false, removeOnFail: false })
           }
         }
       }

@@ -116,8 +116,7 @@ async function validateMaster(masterId: number) {
     const category = isPersonal ? 'personal' : 'business';
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       ON CONFLICT (master_id) DO NOTHING`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
       [masterId, resp.status, JSON.stringify(details), key, domain, mx, message, JSON.stringify({ domain, mx, code: (resp as any)?.detail?.code }), category, outcome, isPersonal, !isPersonal]
     );
     await query(
