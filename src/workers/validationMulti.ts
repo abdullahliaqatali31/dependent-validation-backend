@@ -58,7 +58,14 @@ async function processJob(masterId: number, key: string, workerId: string, worke
   if (m.rows.length === 0) return
   const email = m.rows[0].email_normalized
   const batchId = m.rows[0].batch_id
+
+  // Safety check: if batch doesn't exist anymore (deleted), stop processing
   const b = await query<{ status: string; paused_stage: string | null }>('SELECT status, paused_stage FROM batches WHERE batch_id=$1', [batchId])
+  if (b.rows.length === 0) {
+    // Batch was deleted
+    return
+  }
+
   const paused = String(b.rows[0]?.status || '').toLowerCase() === 'paused'
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase()
   if (paused && pausedStage === 'validation') {
@@ -168,6 +175,14 @@ console.log('validationMulti workers started')
         const stale = (hbTs && now - hbTs > 10 * 60 * 1000) || (batchTs && now - batchTs > 10 * 60 * 1000)
         if (batchIdStr && stale) {
           const batchId = Number(batchIdStr)
+          // Check if batch is already NaN or invalid
+          if (Number.isNaN(batchId)) {
+            console.warn(`[ValidationMulti] Found invalid batchIdStr="${batchIdStr}" for worker ${idx}. Cleaning up.`);
+            await redis.del(`val:worker:${idx}:batch_id`);
+            await redis.del(`val:worker:${idx}:batch_ts`);
+            continue;
+          }
+
           await releaseBatchAssignment(batchId)
           const pending = await query<{ id: number }>(
             'SELECT me.id FROM master_emails me WHERE me.batch_id=$1 AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id) LIMIT 1000',

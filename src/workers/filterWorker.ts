@@ -50,6 +50,9 @@ async function processMaster(masterId: number) {
   const domain = m.rows[0].domain;
   const batchId = m.rows[0].batch_id;
   const b = await query<{ status: string; paused_stage: string | null }>('SELECT status, paused_stage FROM batches WHERE batch_id=$1', [batchId]);
+  if (b.rows.length === 0) {
+    return;
+  }
   const paused = String(b.rows[0]?.status || '').toLowerCase() === 'paused';
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase();
   if (paused && pausedStage === 'filter') {

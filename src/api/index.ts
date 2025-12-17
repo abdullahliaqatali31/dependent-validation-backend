@@ -5,6 +5,7 @@ import { query } from '../db';
 import { dedupeQueue, filterQueue } from '../queues';
 import { personalQueue, validationQueue, validationQueues, QUEUE_NAMES } from '../queues';
 import { publish, CHANNELS, redis } from '../redis';
+import { ensureBatchActivated, assignWorkerRoundRobin, releaseBatchAssignment } from '../utils/validationAssignment';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
@@ -458,6 +459,68 @@ app.post('/batches/:id/resume', async (req, res) => {
     res.json({ ok: true, batchId: id, resume_stage: stage });
   } catch (err: any) {
     res.status(500).json({ error: 'resume_failed', details: err.message });
+  }
+});
+
+app.post('/batches/:id/unstick', async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ error: 'invalid_id' });
+  try {
+    const b = await query<{ status: string }>('SELECT status FROM batches WHERE batch_id=$1', [id]);
+    if (b.rows.length === 0) return res.status(404).json({ error: 'batch_not_found' });
+
+    console.log(`Unsticking batch ${id}...`);
+
+    // 1. Clear locks
+    try {
+      await releaseBatchAssignment(id);
+    } catch (e) {
+      console.error('Release assignment failed:', e);
+    }
+
+    // 2. Re-enqueue filter jobs (limit to 10k to be safe)
+    const filterPending = await query<{ id: number }>(
+      `SELECT me.id
+       FROM master_emails me
+       WHERE me.batch_id=$1
+         AND NOT EXISTS (SELECT 1 FROM filtered_emails fe WHERE fe.master_id=me.id)
+       ORDER BY me.id
+       LIMIT 10000`,
+      [id]
+    );
+    let filterEnq = 0;
+    for (const r of filterPending.rows) {
+      await filterQueue.add('filterEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
+      filterEnq++;
+    }
+
+    // 3. Re-enqueue validation jobs
+    const valPending = await query<{ id: number }>(
+      `SELECT me.id
+       FROM master_emails me
+       JOIN filtered_emails fe ON fe.master_id=me.id
+       WHERE me.batch_id=$1
+         AND fe.status NOT LIKE 'removed:%'
+         AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id)
+       ORDER BY me.id
+       LIMIT 10000`,
+      [id]
+    );
+    let valEnq = 0;
+    if (valPending.rows.length > 0) {
+      await ensureBatchActivated(id);
+      for (const r of valPending.rows) {
+        const idx = await assignWorkerRoundRobin(id);
+        const q = validationQueues[idx] || validationQueues[0];
+        await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: false, removeOnFail: false });
+        valEnq++;
+      }
+    }
+
+    await publish(CHANNELS.batchProgress, { batchId: id, stage: 'unstick', filter_requeued: filterEnq, validation_requeued: valEnq });
+    res.json({ ok: true, batchId: id, filter_requeued: filterEnq, validation_requeued: valEnq });
+  } catch (err: any) {
+    res.status(500).json({ error: 'unstick_failed', details: err.message });
   }
 });
 

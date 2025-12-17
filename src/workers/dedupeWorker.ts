@@ -14,6 +14,16 @@ async function processBatch(batchId: number) {
     'SELECT submitter_id, submitter_uuid, submitter_team_id FROM batches WHERE batch_id=$1',
     [batchId]
   );
+  if (b.rows.length === 0) {
+    return;
+  }
+  const pausedStageQ = await query<{ status: string; paused_stage: string | null }>('SELECT status, paused_stage FROM batches WHERE batch_id=$1', [batchId]);
+  const paused = String(pausedStageQ.rows[0]?.status || '').toLowerCase() === 'paused';
+  const pausedStage = String(pausedStageQ.rows[0]?.paused_stage || '').toLowerCase();
+  if (paused && pausedStage === 'dedupe') {
+    await publish(CHANNELS.batchProgress, { batchId, stage: 'dedupe', status: 'paused' });
+    return;
+  }
   const submitter_id = (b.rows[0]?.submitter_id ?? null) as number | null;
   const submitter_uuid = (b.rows[0]?.submitter_uuid ?? null) as string | null;
   const submitter_team_id = (b.rows[0]?.submitter_team_id ?? null) as number | null;
