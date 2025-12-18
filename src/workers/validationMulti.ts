@@ -162,17 +162,78 @@ config.ninjaKeys.forEach((k, idx) => {
 
 console.log('validationMulti workers started')
 ;(async () => {
+  async function aliveWorkers(): Promise<number[]> {
+    const total = (config.ninjaKeys || []).length
+    const now = Date.now()
+    const alive: number[] = []
+    for (let i = 0; i < total; i++) {
+      const hb = await redis.hget(`worker:val-${i}:status`, 'lastHeartbeat')
+      const hbTs = hb ? Number(hb) : 0
+      if (hbTs && now - hbTs <= 2 * 60 * 1000) alive.push(i)
+    }
+    if (alive.length === 0) {
+      for (let i = 0; i < total; i++) alive.push(i)
+    }
+    return alive
+  }
+  async function redistributeFromWorker(batchId: number, fromIdx: number) {
+    const dests = (await aliveWorkers()).filter(i => i !== fromIdx)
+    const targets = dests.length > 0 ? dests : (await aliveWorkers())
+    const qFrom = validationQueues[fromIdx] || validationQueues[0]
+    const jobs = await qFrom.getJobs(['waiting','delayed','paused'], 0, 5000)
+    let d = 0
+    for (const job of jobs) {
+      const masterId = (job.data as any)?.masterId
+      const destIdx = targets[d % targets.length]
+      const qTo = validationQueues[destIdx] || validationQueues[0]
+      try {
+        await job.remove()
+        await qTo.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false })
+      } catch {}
+      d++
+    }
+    const pending = await query<{ id: number }>(
+      'SELECT me.id FROM master_emails me WHERE me.batch_id=$1 AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id) LIMIT 5000',
+      [batchId]
+    )
+    let i = 0
+    for (const row of pending.rows) {
+      const destIdx = targets[i % targets.length]
+      const qTo = validationQueues[destIdx] || validationQueues[0]
+      try { await qTo.add('validateEmail', { masterId: row.id }, { removeOnComplete: false, removeOnFail: false }) } catch {}
+      i++
+    }
+    try { await publish(CHANNELS.systemMonitor, { type: 'redistribute', batchId, fromIdx, moved: jobs.length, enqueued: pending.rows.length }) } catch {}
+  }
   while (true) {
     try {
       const total = (config.ninjaKeys || []).length
       const now = Date.now()
+      const activeBatchIdStr = await redis.get('val:active_batch_id')
+      if (activeBatchIdStr) {
+        const hbAll: number[] = []
+        for (let i = 0; i < total; i++) {
+          const hb = await redis.hget(`worker:val-${i}:status`, 'lastHeartbeat')
+          hbAll.push(hb ? Number(hb) : 0)
+        }
+        const maxHb = hbAll.reduce((a, b) => Math.max(a, b), 0)
+        if (maxHb && now - maxHb > 5 * 60 * 1000) {
+          const batchId = Number(activeBatchIdStr)
+          if (Number.isFinite(batchId) && batchId > 0) {
+            await releaseBatchAssignment(batchId)
+            for (let i = 0; i < total; i++) {
+              await redistributeFromWorker(batchId, i)
+            }
+          }
+        }
+      }
       for (let idx = 0; idx < total; idx++) {
         const hb = await redis.hget(`worker:val-${idx}:status`, 'lastHeartbeat')
         const hbTs = hb ? Number(hb) : 0
         const batchIdStr = await redis.get(`val:worker:${idx}:batch_id`)
         const batchTsStr = await redis.get(`val:worker:${idx}:batch_ts`)
         const batchTs = batchTsStr ? Number(batchTsStr) : 0
-        const stale = (hbTs && now - hbTs > 10 * 60 * 1000) || (batchTs && now - batchTs > 10 * 60 * 1000)
+        const stale = (hbTs && now - hbTs > 5 * 60 * 1000) || (batchTs && now - batchTs > 5 * 60 * 1000)
         if (batchIdStr && stale) {
           const batchId = Number(batchIdStr)
           // Check if batch is already NaN or invalid
@@ -184,14 +245,7 @@ console.log('validationMulti workers started')
           }
 
           await releaseBatchAssignment(batchId)
-          const pending = await query<{ id: number }>(
-            'SELECT me.id FROM master_emails me WHERE me.batch_id=$1 AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id) LIMIT 1000',
-            [batchId]
-          )
-          for (const row of pending.rows) {
-            const q = validationQueues[idx] || validationQueues[0]
-            if (q) await q.add('validateEmail', { masterId: row.id }, { removeOnComplete: false, removeOnFail: false })
-          }
+          await redistributeFromWorker(batchId, idx)
         }
       }
     } catch (e) { console.error(e) }

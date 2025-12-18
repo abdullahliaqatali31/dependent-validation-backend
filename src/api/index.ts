@@ -1879,3 +1879,46 @@ app.delete('/batches/:id', async (req, res) => {
     res.status(500).json({ error: 'batch_delete_failed', details: err.message });
   }
 });
+
+async function autoValidationMonitor() {
+  try {
+    const activeStr = await redis.get('val:active_batch_id');
+    if (!activeStr) return;
+    const batchId = Number(activeStr);
+    if (!Number.isFinite(batchId) || batchId <= 0) return;
+    const totalWorkers = (await redis.keys('worker:*:status')).length;
+    const now = Date.now();
+    let maxHb = 0;
+    for (let i = 0; i < totalWorkers; i++) {
+      const hb = await redis.hget(`worker:val-${i}:status`, 'lastHeartbeat');
+      const hbTs = hb ? Number(hb) : 0;
+      if (hbTs > maxHb) maxHb = hbTs;
+    }
+    if (maxHb && now - maxHb > 5 * 60 * 1000) {
+      try {
+        await releaseBatchAssignment(batchId);
+      } catch {}
+      const rows = await query<{ id: number }>(
+        `SELECT me.id
+         FROM master_emails me
+         JOIN filtered_emails fe ON fe.master_id = me.id
+         WHERE me.batch_id=$1
+           AND fe.status NOT LIKE 'removed:%'
+           AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id)
+         ORDER BY me.id
+         LIMIT 20000`,
+        [batchId]
+      );
+      const dests: any[] = validationQueues;
+      let i = 0;
+      let enq = 0;
+      for (const r of rows.rows) {
+        const q = dests[i % dests.length] || dests[0];
+        try { await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true }); enq++; } catch {}
+        i++;
+      }
+      await publish(CHANNELS.batchProgress, { batchId, stage: 'auto_unstick', validation_requeued: enq });
+    }
+  } catch {}
+}
+setInterval(() => { autoValidationMonitor(); }, 60000);
