@@ -3,6 +3,7 @@ import '../workers/dedupeWorker';
 import '../workers/filterWorker';
 import '../workers/personalWorker';
 import '../workers/validationMulti';
+import '../workers/queueWatcher';
 import { query } from '../db';
 import { config } from '../config';
 

@@ -68,12 +68,6 @@ async function processJob(masterId: number, key: string, workerId: string, worke
 
   const paused = String(b.rows[0]?.status || '').toLowerCase() === 'paused'
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase()
-  const active = await redis.get('val:active_batch_id')
-  if (active && Number(active) !== batchId) {
-    const q = validationQueues[workerIdx] || validationQueues[0]
-    try { await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}
-    return
-  }
   if (paused && pausedStage === 'validation') {
     const q = validationQueues[workerIdx] || validationQueues[0]
     try { await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}

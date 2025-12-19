@@ -438,11 +438,8 @@ app.post('/batches/:id/resume', async (req, res) => {
            AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id)`,
         [id]
       );
-      await ensureBatchActivated(id);
       for (const r of masters.rows) {
-        const idx = await assignWorkerRoundRobin(id);
-        const q = validationQueues[idx] || validationQueues[0];
-        await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: false, removeOnFail: false });
+        await validationQueue.add('validateEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
       }
     } else if (stage === 'personal') {
       const masters = await query<{ id: number }>(
@@ -1410,18 +1407,48 @@ app.post('/employee/unsubscribes/domains', async (req, res) => {
       [...list, employeeUuid || null]
     );
 
-    for (const d of list) {
-      await query(
-        `INSERT INTO unsubscribe_actions(domain, employee_uuid)
-         VALUES ($1, $2)`,
-        [d, employeeUuid || null]
-      );
-    }
+    const actionPlaceholders = list.map((_, i) => `($${i + 1}, $${list.length + 1})`).join(',');
+    await query(
+      `INSERT INTO unsubscribe_actions(domain, employee_uuid)
+       VALUES ${actionPlaceholders}`,
+      [...list, employeeUuid || null]
+    );
     await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['employee_unsub_domains', null, JSON.stringify({ employee_uuid: employeeUuid, count: list.length })]);
     res.json({ inserted: list.length });
   } catch (err: any) {
     console.error(err);
     res.status(500).json({ error: 'employee_unsub_domains_failed', details: err.message });
+  }
+});
+
+// Employee: fetch unsubscribe upload history (summary)
+app.get('/employee/unsubscribes/uploads', async (req, res) => {
+  try {
+    const employeeUuid = String((req.query.employee_id || '').toString());
+    if (!employeeUuid) return res.status(400).json({ error: 'employee_id_required' });
+    
+    // Fetch from audit_logs where action is employee_unsub_emails or employee_unsub_domains
+    // and details->employee_uuid matches
+    const rows = await query(
+      `SELECT created_at, action_type, details
+       FROM audit_logs
+       WHERE action_type IN ('employee_unsub_emails', 'employee_unsub_domains')
+         AND details->>'employee_uuid' = $1
+       ORDER BY created_at DESC
+       LIMIT 50`,
+      [employeeUuid]
+    );
+    
+    const result = rows.rows.map(r => ({
+      timestamp: r.created_at,
+      type: r.action_type === 'employee_unsub_emails' ? 'Emails' : 'Domains',
+      count: r.details?.count || 0
+    }));
+    
+    res.json(result);
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: 'employee_unsub_uploads_failed', details: err.message });
   }
 });
 
@@ -1742,6 +1769,19 @@ app.get('/admin/system/speed', async (_req, res) => {
     res.json(series);
   } catch (err: any) {
     res.status(500).json({ error: 'admin_system_speed_failed', details: err.message });
+  }
+});
+
+app.get('/admin/system/watcher', async (_req, res) => {
+  try {
+    const lastRun = await redis.get('queue_watcher:last_run');
+    const historyRaw = await redis.lrange('queue_watcher:history', 0, 10);
+    const history = historyRaw.map(h => {
+        try { return JSON.parse(h); } catch { return {}; }
+    });
+    res.json({ last_run: lastRun, history });
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_watcher_stats_failed', details: err.message });
   }
 });
 
