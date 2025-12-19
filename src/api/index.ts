@@ -438,7 +438,11 @@ app.post('/batches/:id/resume', async (req, res) => {
         [id]
       );
       for (const r of masters.rows) {
-        await filterQueue.add('filterEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
+        await filterQueue.add('filterEmail', { masterId: r.id }, { 
+            jobId: `filter-${r.id}`,
+            removeOnComplete: true, 
+            removeOnFail: true 
+        });
       }
     } else if (stage === 'validation') {
       const masters = await query<{ id: number }>(
@@ -504,7 +508,11 @@ app.post('/batches/:id/unstick', async (req, res) => {
     );
     let filterEnq = 0;
     for (const r of filterPending.rows) {
-      await filterQueue.add('filterEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
+      await filterQueue.add('filterEmail', { masterId: r.id }, { 
+        jobId: `filter-${r.id}`,
+        removeOnComplete: true, 
+        removeOnFail: true 
+      });
       filterEnq++;
     }
 

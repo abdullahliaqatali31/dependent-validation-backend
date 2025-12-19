@@ -72,7 +72,8 @@ async function processMaster(masterId: number) {
   const finalReason = unsub && cleaned.cleaned ? 'unsubscribed' : cleaned.reason;
   await query(
     `INSERT INTO filtered_emails(batch_id, master_id, original_email, cleaned_email, status, reason, domain, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (master_id) DO NOTHING`,
     [batchId, masterId, original, cleaned.cleaned, finalStatus, finalReason, cleaned.domain, JSON.stringify({ flags: res.flags, matched_keyword: res.matchedKeyword, matched_domain: res.matchedDomain, unsubscribed: unsub })]
   );
   const removed = String(finalStatus).startsWith('removed:');
