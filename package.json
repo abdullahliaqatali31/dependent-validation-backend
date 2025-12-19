@@ -16,6 +16,7 @@
     "sync:ninja": "ts-node-dev --transpile-only src/scripts/syncNinjaKeys.ts",
     "debug:validation": "ts-node-dev --transpile-only src/scripts/debugValidation.ts",
     "clean:filter": "ts-node-dev --transpile-only src/scripts/clearFilterQueue.ts",
+    "reset:redis": "ts-node src/scripts/flushRedis.ts",
     "unstick:batch": "ts-node-dev --transpile-only src/scripts/unstickBatch.ts",
     "test:ninja": "ts-node-dev --transpile-only src/scripts/testNinja.ts",
     "dev": "npm run api",
