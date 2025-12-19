@@ -68,7 +68,7 @@ async function checkAndResume() {
             activity.stuck_filter += missing.rows.length;
             for (const m of missing.rows) {
                 await filterQueue.add('filterEmail', { masterId: m.id }, {
-                    jobId: `filter-${m.id}-${Date.now()}`, 
+                    jobId: `filter-${m.id}`, 
                     removeOnComplete: true,
                     removeOnFail: true
                 });
@@ -122,7 +122,7 @@ async function checkAndResume() {
                 const idx = await assignWorkerRoundRobin(batchId);
                 const q = validationQueues[idx] || validationQueues[0];
                 await q.add('validateEmail', { masterId: m.id }, {
-                    jobId: `val-${m.id}-${Date.now()}`, 
+                    jobId: `val-${m.id}`, 
                     removeOnComplete: false, 
                     removeOnFail: false
                 });
@@ -161,7 +161,7 @@ async function checkAndResume() {
             activity.stuck_split += missing.rows.length;
             for (const m of missing.rows) {
                  await personalQueue.add('personalCheck', { masterId: m.id }, {
-                    jobId: `split-${m.id}-${Date.now()}`,
+                    jobId: `split-${m.id}`,
                     removeOnComplete: true,
                     removeOnFail: true
                 });
