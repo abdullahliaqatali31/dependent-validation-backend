@@ -349,6 +349,20 @@ app.get('/batches/:id/filtration', async (req, res) => {
   }
 });
 
+app.get('/admin/system/watcher', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const lastRun = await redis.get('queue_watcher:last_run');
+    const history = await redis.lrange('queue_watcher:history', 0, 49);
+    res.json({
+      last_run: lastRun,
+      history: history.map(h => JSON.parse(h))
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'watcher_stats_failed', details: err.message });
+  }
+});
+
 // Re-run pipeline for an existing batch: clears downstream tables and re-enqueues filter jobs
 app.post('/batches/:id/rerun', async (req, res) => {
   const id = Number(req.params.id);

@@ -72,8 +72,15 @@ async function processBatch(batchId: number) {
 export const dedupeWorker = new Worker(
   'dedupeQueue',
   async (job: Job) => {
+    console.log(`[DedupeWorker] Processing job ${job.id} for batch ${job.data.batchId}`);
     const { batchId } = job.data as { batchId: number };
-    await processBatch(batchId);
+    try {
+        await processBatch(batchId);
+        console.log(`[DedupeWorker] Completed job ${job.id}`);
+    } catch (e) {
+        console.error(`[DedupeWorker] Failed job ${job.id}:`, e);
+        throw e;
+    }
   },
   defaultWorkerOptions(config.redisUrl)
 );

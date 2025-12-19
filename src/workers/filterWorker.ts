@@ -99,8 +99,14 @@ async function processMaster(masterId: number) {
 export const filterWorker = new Worker(
   'filterQueue',
   async (job: Job) => {
+    // console.log(`[FilterWorker] Processing job ${job.id} for masterId ${job.data.masterId}`);
     const { masterId } = job.data as { masterId: number };
-    await processMaster(masterId);
+    try {
+        await processMaster(masterId);
+    } catch (e) {
+        console.error(`[FilterWorker] Failed job ${job.id} (masterId ${masterId}):`, e);
+        throw e;
+    }
   },
   { ...defaultWorkerOptions(config.redisUrl), concurrency: 10 }
 );
