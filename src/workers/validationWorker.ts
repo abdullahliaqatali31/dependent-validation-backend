@@ -4,6 +4,8 @@ import { config } from '../config';
 import { query } from '../db';
 import { publish, CHANNELS } from '../redis';
 import { QUEUE_NAMES, personalQueue } from '../queues';
+import { redis } from '../redis';
+import { releaseBatchAssignment } from '../utils/validationAssignment';
 
 
 function sleep(ms: number) {
@@ -74,6 +76,10 @@ async function validateMaster(masterId: number) {
   if (m.rows.length === 0) return;
   const email = m.rows[0].email_normalized;
   const batchId = m.rows[0].batch_id;
+  const active = await redis.get('val:active_batch_id');
+  if (active && Number(active) !== batchId) {
+    return;
+  }
   const b = await query<{ status: string; paused_stage: string | null }>('SELECT status, paused_stage FROM batches WHERE batch_id=$1', [batchId]);
   const paused = String(b.rows[0]?.status || '').toLowerCase() === 'paused';
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase();
@@ -138,6 +144,7 @@ async function validateMaster(masterId: number) {
       if (total > 0 && done >= total) {
         await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [batchId, 'completed']);
         await publish(CHANNELS.batchProgress, { batchId, step: 'done', stage: 'completed', processed: done, total });
+        await releaseBatchAssignment(batchId);
       }
       await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: false, removeOnFail: false });
     } catch {}

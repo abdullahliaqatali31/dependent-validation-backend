@@ -438,8 +438,11 @@ app.post('/batches/:id/resume', async (req, res) => {
            AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id)`,
         [id]
       );
+      await ensureBatchActivated(id);
       for (const r of masters.rows) {
-        await validationQueue.add('validateEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
+        const idx = await assignWorkerRoundRobin(id);
+        const q = validationQueues[idx] || validationQueues[0];
+        await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: false, removeOnFail: false });
       }
     } else if (stage === 'personal') {
       const masters = await query<{ id: number }>(
@@ -1742,6 +1745,39 @@ app.get('/admin/system/speed', async (_req, res) => {
   }
 });
 
+app.post('/admin/validation/rebalance', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const batchId = Number((req.body?.batch_id || 0));
+    if (!batchId) return res.status(400).json({ error: 'missing_batch_id' });
+    const b = await query('SELECT 1 FROM batches WHERE batch_id=$1', [batchId]);
+    if (b.rows.length === 0) return res.status(404).json({ error: 'batch_not_found' });
+    await releaseBatchAssignment(batchId);
+    await ensureBatchActivated(batchId);
+    const queues = validationQueues;
+    let moved = 0;
+    for (let idx = 0; idx < queues.length; idx++) {
+      const srcQ = queues[idx];
+      const jobs = await srcQ.getJobs(['waiting','delayed'], 0, -1);
+      for (const j of jobs) {
+        const mid = Number((j as any)?.data?.masterId || 0);
+        if (!mid) continue;
+        try { await j.remove(); } catch {}
+        const toIdx = await assignWorkerRoundRobin(batchId);
+        const destQ = queues[toIdx] || queues[0];
+        if (destQ) {
+          await destQ.add('validateEmail', { masterId: mid }, { removeOnComplete: false, removeOnFail: false });
+          moved++;
+        }
+      }
+    }
+    await publish(CHANNELS.batchProgress, { batchId, stage: 'rebalance', moved });
+    res.json({ ok: true, batchId, moved });
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_rebalance_failed', details: err.message });
+  }
+});
+
 // Admin: queue stats (waiting, active, delayed, completed, failed)
 app.get('/admin/queues/stats', async (_req, res) => {
   try {
@@ -1879,46 +1915,3 @@ app.delete('/batches/:id', async (req, res) => {
     res.status(500).json({ error: 'batch_delete_failed', details: err.message });
   }
 });
-
-async function autoValidationMonitor() {
-  try {
-    const activeStr = await redis.get('val:active_batch_id');
-    if (!activeStr) return;
-    const batchId = Number(activeStr);
-    if (!Number.isFinite(batchId) || batchId <= 0) return;
-    const totalWorkers = (await redis.keys('worker:*:status')).length;
-    const now = Date.now();
-    let maxHb = 0;
-    for (let i = 0; i < totalWorkers; i++) {
-      const hb = await redis.hget(`worker:val-${i}:status`, 'lastHeartbeat');
-      const hbTs = hb ? Number(hb) : 0;
-      if (hbTs > maxHb) maxHb = hbTs;
-    }
-    if (maxHb && now - maxHb > 5 * 60 * 1000) {
-      try {
-        await releaseBatchAssignment(batchId);
-      } catch {}
-      const rows = await query<{ id: number }>(
-        `SELECT me.id
-         FROM master_emails me
-         JOIN filtered_emails fe ON fe.master_id = me.id
-         WHERE me.batch_id=$1
-           AND fe.status NOT LIKE 'removed:%'
-           AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id)
-         ORDER BY me.id
-         LIMIT 20000`,
-        [batchId]
-      );
-      const dests: any[] = validationQueues;
-      let i = 0;
-      let enq = 0;
-      for (const r of rows.rows) {
-        const q = dests[i % dests.length] || dests[0];
-        try { await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true }); enq++; } catch {}
-        i++;
-      }
-      await publish(CHANNELS.batchProgress, { batchId, stage: 'auto_unstick', validation_requeued: enq });
-    }
-  } catch {}
-}
-setInterval(() => { autoValidationMonitor(); }, 60000);

@@ -4,7 +4,7 @@ import { config } from '../config'
 import { query } from '../db'
 import { redis, publish, CHANNELS } from '../redis'
 import { QUEUE_NAMES, personalQueue, validationQueues } from '../queues'
-import { releaseBatchAssignment } from '../utils/validationAssignment'
+import { releaseBatchAssignment, ensureBatchActivated, assignWorkerRoundRobin } from '../utils/validationAssignment'
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
 
@@ -68,6 +68,12 @@ async function processJob(masterId: number, key: string, workerId: string, worke
 
   const paused = String(b.rows[0]?.status || '').toLowerCase() === 'paused'
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase()
+  const active = await redis.get('val:active_batch_id')
+  if (active && Number(active) !== batchId) {
+    const q = validationQueues[workerIdx] || validationQueues[0]
+    try { await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}
+    return
+  }
   if (paused && pausedStage === 'validation') {
     const q = validationQueues[workerIdx] || validationQueues[0]
     try { await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}
@@ -162,81 +168,19 @@ config.ninjaKeys.forEach((k, idx) => {
 
 console.log('validationMulti workers started')
 ;(async () => {
-  async function aliveWorkers(): Promise<number[]> {
-    const total = (config.ninjaKeys || []).length
-    const now = Date.now()
-    const alive: number[] = []
-    for (let i = 0; i < total; i++) {
-      const hb = await redis.hget(`worker:val-${i}:status`, 'lastHeartbeat')
-      const hbTs = hb ? Number(hb) : 0
-      if (hbTs && now - hbTs <= 2 * 60 * 1000) alive.push(i)
-    }
-    if (alive.length === 0) {
-      for (let i = 0; i < total; i++) alive.push(i)
-    }
-    return alive
-  }
-  async function redistributeFromWorker(batchId: number, fromIdx: number) {
-    const dests = (await aliveWorkers()).filter(i => i !== fromIdx)
-    const targets = dests.length > 0 ? dests : (await aliveWorkers())
-    const qFrom = validationQueues[fromIdx] || validationQueues[0]
-    const jobs = await qFrom.getJobs(['waiting','delayed','paused'], 0, 5000)
-    let d = 0
-    for (const job of jobs) {
-      const masterId = (job.data as any)?.masterId
-      const destIdx = targets[d % targets.length]
-      const qTo = validationQueues[destIdx] || validationQueues[0]
-      try {
-        await job.remove()
-        await qTo.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false })
-      } catch {}
-      d++
-    }
-    const pending = await query<{ id: number }>(
-      'SELECT me.id FROM master_emails me WHERE me.batch_id=$1 AND NOT EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id) LIMIT 5000',
-      [batchId]
-    )
-    let i = 0
-    for (const row of pending.rows) {
-      const destIdx = targets[i % targets.length]
-      const qTo = validationQueues[destIdx] || validationQueues[0]
-      try { await qTo.add('validateEmail', { masterId: row.id }, { removeOnComplete: false, removeOnFail: false }) } catch {}
-      i++
-    }
-    try { await publish(CHANNELS.systemMonitor, { type: 'redistribute', batchId, fromIdx, moved: jobs.length, enqueued: pending.rows.length }) } catch {}
-  }
   while (true) {
     try {
       const total = (config.ninjaKeys || []).length
       const now = Date.now()
-      const activeBatchIdStr = await redis.get('val:active_batch_id')
-      if (activeBatchIdStr) {
-        const hbAll: number[] = []
-        for (let i = 0; i < total; i++) {
-          const hb = await redis.hget(`worker:val-${i}:status`, 'lastHeartbeat')
-          hbAll.push(hb ? Number(hb) : 0)
-        }
-        const maxHb = hbAll.reduce((a, b) => Math.max(a, b), 0)
-        if (maxHb && now - maxHb > 5 * 60 * 1000) {
-          const batchId = Number(activeBatchIdStr)
-          if (Number.isFinite(batchId) && batchId > 0) {
-            await releaseBatchAssignment(batchId)
-            for (let i = 0; i < total; i++) {
-              await redistributeFromWorker(batchId, i)
-            }
-          }
-        }
-      }
       for (let idx = 0; idx < total; idx++) {
         const hb = await redis.hget(`worker:val-${idx}:status`, 'lastHeartbeat')
         const hbTs = hb ? Number(hb) : 0
         const batchIdStr = await redis.get(`val:worker:${idx}:batch_id`)
         const batchTsStr = await redis.get(`val:worker:${idx}:batch_ts`)
         const batchTs = batchTsStr ? Number(batchTsStr) : 0
-        const stale = (hbTs && now - hbTs > 5 * 60 * 1000) || (batchTs && now - batchTs > 5 * 60 * 1000)
+        const stale = (hbTs && now - hbTs > 10 * 60 * 1000) || (batchTs && now - batchTs > 10 * 60 * 1000)
         if (batchIdStr && stale) {
           const batchId = Number(batchIdStr)
-          // Check if batch is already NaN or invalid
           if (Number.isNaN(batchId)) {
             console.warn(`[ValidationMulti] Found invalid batchIdStr="${batchIdStr}" for worker ${idx}. Cleaning up.`);
             await redis.del(`val:worker:${idx}:batch_id`);
@@ -245,7 +189,23 @@ console.log('validationMulti workers started')
           }
 
           await releaseBatchAssignment(batchId)
-          await redistributeFromWorker(batchId, idx)
+          await ensureBatchActivated(batchId)
+          const srcQ = validationQueues[idx]
+          if (srcQ) {
+            const jobs = await srcQ.getJobs(['waiting','delayed'], 0, -1)
+            for (const j of jobs) {
+              const mid = Number((j as any)?.data?.masterId || 0)
+              if (!mid) continue
+              try {
+                await j.remove()
+              } catch {}
+              const toIdx = await assignWorkerRoundRobin(batchId)
+              const destQ = validationQueues[toIdx] || validationQueues[0]
+              if (destQ) {
+                await destQ.add('validateEmail', { masterId: mid }, { removeOnComplete: false, removeOnFail: false })
+              }
+            }
+          }
         }
       }
     } catch (e) { console.error(e) }
