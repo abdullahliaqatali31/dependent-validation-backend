@@ -1,7 +1,7 @@
 
 import { query } from '../db';
 import { dedupeQueue, filterQueue, validationQueues, personalQueue } from '../queues';
-import { ensureBatchActivated, assignWorkerRoundRobin } from '../utils/validationAssignment';
+import { ensureBatchActivated, assignWorkerRoundRobin, releaseBatchAssignment } from '../utils/validationAssignment';
 import { redis } from '../redis';
 
 const CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -103,8 +103,22 @@ async function checkAndResume() {
         // Prevent hanging: Check if another batch is currently active
         const activeBatchId = await redis.get('val:active_batch_id');
         if (activeBatchId && Number(activeBatchId) !== batchId) {
-            console.log(`[QueueWatcher] Another batch (${activeBatchId}) is active. Skipping validation check for batch ${batchId} to prevent blocking.`);
-            continue;
+             // Self-healing: Check if the active batch is actually done
+             try {
+                const activeStatusQ = await query('SELECT status FROM batches WHERE batch_id=$1', [activeBatchId]);
+                const activeStatus = String(activeStatusQ.rows[0]?.status || '').toLowerCase();
+                if (activeStatus === 'completed' || activeStatus === 'cancelled') {
+                     console.log(`[QueueWatcher] Active batch ${activeBatchId} is ${activeStatus} but holds lock. Releasing...`);
+                     await releaseBatchAssignment(Number(activeBatchId));
+                     // Lock released, proceed with current batch
+                } else {
+                     console.log(`[QueueWatcher] Another batch (${activeBatchId}) is active (status=${activeStatus}). Skipping validation check for batch ${batchId} to prevent blocking.`);
+                     continue;
+                }
+             } catch (e) {
+                 console.error('[QueueWatcher] Error checking active batch status:', e);
+                 continue;
+             }
         }
 
         await ensureBatchActivated(batchId);
