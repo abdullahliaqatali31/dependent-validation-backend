@@ -4,7 +4,7 @@ import { dedupeQueue, filterQueue, validationQueues, personalQueue } from '../qu
 import { ensureBatchActivated, assignWorkerRoundRobin } from '../utils/validationAssignment';
 import { redis } from '../redis';
 
-const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -68,7 +68,7 @@ async function checkAndResume() {
             activity.stuck_filter += missing.rows.length;
             for (const m of missing.rows) {
                 await filterQueue.add('filterEmail', { masterId: m.id }, {
-                    jobId: `filter-${m.id}`, 
+                    jobId: `filter-${m.id}-${Date.now()}`, 
                     removeOnComplete: true,
                     removeOnFail: true
                 });
@@ -122,7 +122,7 @@ async function checkAndResume() {
                 const idx = await assignWorkerRoundRobin(batchId);
                 const q = validationQueues[idx] || validationQueues[0];
                 await q.add('validateEmail', { masterId: m.id }, {
-                    jobId: `val-${m.id}`, 
+                    jobId: `val-${m.id}-${Date.now()}`, 
                     removeOnComplete: false, 
                     removeOnFail: false
                 });
@@ -161,7 +161,7 @@ async function checkAndResume() {
             activity.stuck_split += missing.rows.length;
             for (const m of missing.rows) {
                  await personalQueue.add('personalCheck', { masterId: m.id }, {
-                    jobId: `split-${m.id}`,
+                    jobId: `split-${m.id}-${Date.now()}`,
                     removeOnComplete: true,
                     removeOnFail: true
                 });
@@ -180,7 +180,7 @@ async function checkAndResume() {
 
 // Start the loop
 (async () => {
-  console.log('[QueueWatcher] Started. Running every 5 minutes.');
+  console.log('[QueueWatcher] Started. Running every 1 minute.');
   while (true) {
     await checkAndResume();
     await sleep(CHECK_INTERVAL_MS);
