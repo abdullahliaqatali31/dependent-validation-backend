@@ -7,7 +7,7 @@ import { cleanEmail } from '../utils/emailCleaner';
 import { isUnsubscribed } from '../utils/unsubscribeFilter';
 import { validationQueues } from '../queues';
 import { assignWorkerRoundRobin, ensureBatchActivated } from '../utils/validationAssignment';
-import { publish, CHANNELS } from '../redis';
+import { publish, CHANNELS, redis } from '../redis';
 
 async function loadRulesFor(masterId: number) {
   const m = await query<{ submitter_id: number | null; submitter_team_id: number | null }>(
@@ -85,6 +85,13 @@ async function processMaster(masterId: number) {
   } catch {}
   await publish(CHANNELS.batchProgress, { stage: 'filter', status: removed ? 'excluded' : 'passed', master_id: masterId });
   if (removed) return;
+
+  // Check for active batch lock to avoid hanging
+  const activeBatchId = await redis.get('val:active_batch_id');
+  if (activeBatchId && Number(activeBatchId) !== batchId) {
+     return;
+  }
+
   try {
     await ensureBatchActivated(batchId);
     const idx = await assignWorkerRoundRobin(batchId);

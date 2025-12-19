@@ -100,6 +100,13 @@ async function checkAndResume() {
             continue;
         }
 
+        // Prevent hanging: Check if another batch is currently active
+        const activeBatchId = await redis.get('val:active_batch_id');
+        if (activeBatchId && Number(activeBatchId) !== batchId) {
+            console.log(`[QueueWatcher] Another batch (${activeBatchId}) is active. Skipping validation check for batch ${batchId} to prevent blocking.`);
+            continue;
+        }
+
         await ensureBatchActivated(batchId);
 
         const missing = await query<{ id: number }>(
