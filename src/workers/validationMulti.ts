@@ -95,7 +95,8 @@ async function processJob(masterId: number, key: string, workerId: string, worke
     const category = isPersonal ? 'personal' : 'business'
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (master_id) DO NOTHING`,
       [masterId, status, JSON.stringify(data), key, domain, mx, message, JSON.stringify({ domain, mx, code }), category, outcome, isPersonal, !isPersonal]
     )
     await query(
