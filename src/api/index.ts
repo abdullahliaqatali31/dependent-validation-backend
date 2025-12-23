@@ -165,7 +165,7 @@ app.get('/batches/:id/steps', async (req, res) => {
       upload: { processed: totalUploaded, total: totalUploaded },
       dedupe: { processed: master, total: staged + master },
       filter: { processed: filtered, total: master },
-      clean: { processed: cleaned, total: master },
+      clean: { processed: cleaned, total: passedFilter + (filtered - passedFilter) }, // Total is all filtered emails (cleaned + removed)
       validation: { processed: validated, total: passedFilter },
       split: { processed: personal, total: validated },
       done: { processed: validated, total: passedFilter }
