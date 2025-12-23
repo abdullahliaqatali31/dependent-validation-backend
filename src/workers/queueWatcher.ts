@@ -140,13 +140,39 @@ async function checkAndResume() {
             console.log(`[QueueWatcher] Found ${missing.rows.length} pending validation jobs for batch ${batchId}`);
             activity.stuck_validation += missing.rows.length;
             for (const m of missing.rows) {
-                const idx = await assignWorkerRoundRobin(batchId);
-                const q = validationQueues[idx] || validationQueues[0];
-                await q.add('validateEmail', { masterId: m.id }, {
-                    jobId: `val-${m.id}`, 
-                    removeOnComplete: false, 
-                    removeOnFail: false
-                });
+                const jobId = `val-${m.id}`;
+                let shouldAdd = true;
+
+                // Check if job exists in any queue
+                for (const q of validationQueues) {
+                    try {
+                        const existing = await q.getJob(jobId);
+                        if (existing) {
+                            const state = await existing.getState();
+                            if (state === 'failed') {
+                                // If failed, remove it so we can re-add (retry)
+                                try { await existing.remove(); } catch {}
+                            } else {
+                                // waiting, active, delayed, completed, etc.
+                                shouldAdd = false;
+                            }
+                            // If we found the job, we don't need to check other queues
+                            break; 
+                        }
+                    } catch (e) {
+                        console.warn(`[QueueWatcher] Error checking job ${jobId}`, e);
+                    }
+                }
+
+                if (shouldAdd) {
+                    const idx = await assignWorkerRoundRobin(batchId);
+                    const q = validationQueues[idx] || validationQueues[0];
+                    await q.add('validateEmail', { masterId: m.id }, {
+                        jobId, 
+                        removeOnComplete: false, 
+                        removeOnFail: false
+                    });
+                }
             }
         }
     }

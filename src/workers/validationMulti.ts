@@ -191,13 +191,18 @@ console.log('validationMulti workers started')
             for (const j of jobs) {
               const mid = Number((j as any)?.data?.masterId || 0)
               if (!mid) continue
+              const oldJobId = j.id
               try {
                 await j.remove()
               } catch {}
               const toIdx = await assignWorkerRoundRobin(batchId)
               const destQ = validationQueues[toIdx] || validationQueues[0]
               if (destQ) {
-                await destQ.add('validateEmail', { masterId: mid }, { removeOnComplete: false, removeOnFail: false })
+                await destQ.add('validateEmail', { masterId: mid }, { 
+                  jobId: oldJobId || `val-${mid}`,
+                  removeOnComplete: false, 
+                  removeOnFail: false 
+                })
               }
             }
           }
