@@ -24,7 +24,10 @@ async function checkAndResume() {
   try {
     // 1. Stuck Dedupe (Batches with data in temp but not processing)
     const stuckDedupe = await query<{ batch_id: number }>(
-      `SELECT DISTINCT batch_id FROM master_emails_temp`
+      `SELECT DISTINCT met.batch_id 
+       FROM master_emails_temp met
+       JOIN batches b ON b.batch_id = met.batch_id
+       WHERE b.status NOT IN ('completed', 'cancelled')`
     );
     
     for (const row of stuckDedupe.rows) {
@@ -47,8 +50,10 @@ async function checkAndResume() {
     const stuckFilter = await query<{ batch_id: number }>(
       `SELECT DISTINCT me.batch_id 
        FROM master_emails me 
+       JOIN batches b ON b.batch_id = me.batch_id
        LEFT JOIN filtered_emails fe ON fe.master_id = me.id 
        WHERE fe.id IS NULL 
+         AND b.status NOT IN ('completed', 'cancelled')
        LIMIT 50` 
     );
 
@@ -80,10 +85,12 @@ async function checkAndResume() {
     const stuckValidation = await query<{ batch_id: number }>(
         `SELECT DISTINCT me.batch_id
          FROM master_emails me
+         JOIN batches b ON b.batch_id = me.batch_id
          JOIN filtered_emails fe ON fe.master_id = me.id
          LEFT JOIN validation_results vr ON vr.master_id = me.id
          WHERE fe.status NOT LIKE 'removed:%'
            AND vr.master_id IS NULL
+           AND b.status NOT IN ('completed', 'cancelled')
          LIMIT 50`
     );
 
@@ -182,9 +189,11 @@ async function checkAndResume() {
         `SELECT DISTINCT me.batch_id
          FROM validation_results vr
          JOIN master_emails me ON vr.master_id = me.id
+         JOIN batches b ON b.batch_id = me.batch_id
          LEFT JOIN final_personal_emails fpe ON fpe.master_id = me.id
          LEFT JOIN final_business_emails fbe ON fbe.master_id = me.id
          WHERE fpe.id IS NULL AND fbe.id IS NULL
+           AND b.status NOT IN ('completed', 'cancelled')
          LIMIT 50`
     );
 
