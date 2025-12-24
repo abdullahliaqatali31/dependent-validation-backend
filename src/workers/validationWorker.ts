@@ -1,5 +1,5 @@
 import { Worker, Job } from 'bullmq';
-import { defaultWorkerOptions } from './common';
+import { defaultWorkerOptions, DEFAULT_PUBLIC_DOMAINS } from './common';
 import { config } from '../config';
 import { query } from '../db';
 import { publish, CHANNELS } from '../redis';
@@ -84,8 +84,8 @@ async function validateMaster(masterId: number) {
   if (!Array.isArray(config.ninjaKeys) || config.ninjaKeys.length === 0) {
     const domainQ = await query<{ domain: string | null }>('SELECT domain FROM master_emails WHERE id=$1', [masterId]);
     const domain = domainQ.rows[0]?.domain || null;
-    const isPersonalQ = await query<{ count: string }>('SELECT COUNT(*) FROM public_provider_domains WHERE domain=$1', [domain || '']);
-    const isPersonal = Number(isPersonalQ.rows[0]?.count || 0) > 0;
+    const isPersonalDB = await query<{ count: string }>('SELECT COUNT(*) FROM public_provider_domains WHERE domain=$1', [domain || '']);
+    const isPersonal = (DEFAULT_PUBLIC_DOMAINS.has((domain || '').toLowerCase())) || (Number(isPersonalDB.rows[0]?.count || 0) > 0);
     const category = isPersonal ? 'personal' : 'business';
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)
@@ -111,8 +111,8 @@ async function validateMaster(masterId: number) {
     const details = resp.detail || {};
     if (message && typeof details === 'object') (details as any).reason = (details as any).reason || message;
     const outcome = mapNinjaOutcome(message || '', (resp as any)?.detail?.code);
-    const isPersonalQ = await query<{ count: string }>('SELECT COUNT(*) FROM public_provider_domains WHERE domain=$1', [domain || '']);
-    const isPersonal = Number(isPersonalQ.rows[0]?.count || 0) > 0;
+    const isPersonalDB = await query<{ count: string }>('SELECT COUNT(*) FROM public_provider_domains WHERE domain=$1', [domain || '']);
+    const isPersonal = (DEFAULT_PUBLIC_DOMAINS.has((domain || '').toLowerCase())) || (Number(isPersonalDB.rows[0]?.count || 0) > 0);
     const category = isPersonal ? 'personal' : 'business';
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)

@@ -1,5 +1,5 @@
 import { Worker, Job } from 'bullmq'
-import { defaultWorkerOptions } from './common'
+import { defaultWorkerOptions, DEFAULT_PUBLIC_DOMAINS } from './common'
 import { config } from '../config'
 import { query } from '../db'
 import { redis, publish, CHANNELS } from '../redis'
@@ -90,8 +90,8 @@ async function processJob(masterId: number, key: string, workerId: string, worke
       else if (mm.includes('mx')) status = 'invalid'
     }
     const outcome = mapOutcome(message, code)
-    const isPersonalQ = await query<{ count: string }>('SELECT COUNT(*) FROM public_provider_domains WHERE domain=$1', [domain || ''])
-    const isPersonal = Number(isPersonalQ.rows[0]?.count || 0) > 0
+    const isPersonalDB = await query<{ count: string }>('SELECT COUNT(*) FROM public_provider_domains WHERE domain=$1', [domain || ''])
+    const isPersonal = (DEFAULT_PUBLIC_DOMAINS.has((domain || '').toLowerCase())) || (Number(isPersonalDB.rows[0]?.count || 0) > 0)
     const category = isPersonal ? 'personal' : 'business'
     await query(
       `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)

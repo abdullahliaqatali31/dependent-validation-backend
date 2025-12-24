@@ -1,11 +1,12 @@
 import { Worker, Job } from 'bullmq';
-import { defaultWorkerOptions } from './common';
+import { defaultWorkerOptions, DEFAULT_PUBLIC_DOMAINS } from './common';
 import { config } from '../config';
 import { query } from '../db';
 import { validationQueue } from '../queues';
 import { publish, CHANNELS } from '../redis';
 
 async function isPublicDomain(domain: string): Promise<boolean> {
+  if (DEFAULT_PUBLIC_DOMAINS.has(domain.toLowerCase())) return true;
   const r = await query('SELECT 1 FROM public_provider_domains WHERE domain=$1', [domain]);
   return r.rows.length > 0;
 }
@@ -26,8 +27,8 @@ async function processMaster(masterId: number) {
   const outcome = String(vr.rows[0].outcome || '').toLowerCase();
   let category = String(vr.rows[0].category || '').toLowerCase();
 
-  // Force category to personal if domain is in public_provider_domains
-  if (await isPublicDomain(domain)) {
+  const isPublic = await isPublicDomain(domain);
+  if (isPublic) {
     category = 'personal';
   }
 

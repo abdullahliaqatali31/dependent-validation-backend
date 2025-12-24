@@ -18,6 +18,21 @@ export function defaultRedisOptions(redisUrl: string): QueueOptions {
   };
 }
 
+export const DEFAULT_PUBLIC_DOMAINS = new Set([
+  'gmail.com',
+  'yahoo.com',
+  'outlook.com',
+  'hotmail.com',
+  'aol.com',
+  'icloud.com',
+  'proton.me',
+  'live.com',
+  'msn.com',
+  'yandex.com',
+  'zoho.com',
+  'mail.com'
+]);
+
 export function defaultWorkerOptions(redisUrl: string): WorkerOptions {
   const u = new URL(redisUrl);
   const password = (u.password || '') || undefined;
