@@ -111,7 +111,13 @@ async function processJob(masterId: number, key: string, workerId: string, worke
     await redis.incr(`worker:${workerId}:req_today`)
     await redis.lpush('val_speed_points', Date.now().toString())
     await redis.ltrim('val_speed_points', 0, 6000)
-    const totalQ = await query<{ count: string }>('SELECT COUNT(*) FROM master_emails WHERE batch_id=$1', [batchId])
+    const totalQ = await query<{ count: string }>(
+      `SELECT COUNT(*) 
+       FROM filtered_emails fe 
+       JOIN master_emails me ON fe.master_id = me.id 
+       WHERE me.batch_id=$1 AND fe.status NOT LIKE 'removed:%'`, 
+      [batchId]
+    )
     const doneQ = await query<{ count: string }>('SELECT COUNT(*) FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1', [batchId])
     const total = Number(totalQ.rows[0]?.count || 0)
     const done = Number(doneQ.rows[0]?.count || 0)
@@ -123,6 +129,18 @@ async function processJob(masterId: number, key: string, workerId: string, worke
     }
     await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: true, removeOnFail: true })
   } catch (e: any) {
+    // If we fail here, we MUST record it so the job doesn't loop forever in QueueWatcher
+    try {
+        await query(
+            `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, outcome, category)
+             VALUES ($1, 'unknown', $2, $3, 'rejected', 'business')
+             ON CONFLICT (master_id) DO NOTHING`,
+            [masterId, JSON.stringify({ error: (e as any)?.message || String(e), ts: Date.now() }), key]
+        );
+    } catch (dbErr) {
+        console.error('Failed to record validation error', dbErr);
+    }
+
     await redis.incr(`worker:${workerId}:req_today`)
     if (String(e?.message || '').includes('http_429') || String(e?.message || '').includes('429')) {
       await sleep(config.ninjaDelayMs * 2)
