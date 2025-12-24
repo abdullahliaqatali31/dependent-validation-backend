@@ -364,6 +364,48 @@ app.get('/admin/system/watcher', async (req, res) => {
 });
 
 // Re-run pipeline for an existing batch: clears downstream tables and re-enqueues filter jobs
+app.get('/collection/pool-stats', async (req, res) => {
+  try {
+    const stats = await query<{ category: string, outcome: string, c: string }>(
+      `SELECT category, outcome, COUNT(*) AS c 
+       FROM free_pool 
+       WHERE is_free_pool = true AND is_assigned = false
+       GROUP BY category, outcome`
+    );
+    
+    const result: any = {
+      business: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0, unknown: 0 },
+      personal: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0, unknown: 0 },
+      total: 0
+    };
+
+    for (const r of stats.rows) {
+      const cat = String(r.category || 'business').toLowerCase();
+      const out = String(r.outcome || 'unknown').toLowerCase();
+      const count = Number(r.c || 0);
+      
+      if (cat === 'personal') {
+          if (result.personal[out] !== undefined) {
+              result.personal[out] += count;
+          } else {
+               result.personal.unknown += count;
+          }
+      } else {
+          if (result.business[out] !== undefined) {
+              result.business[out] += count;
+          } else {
+               result.business.unknown += count;
+          }
+      }
+      result.total += count;
+    }
+
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: 'pool_stats_failed', details: err.message });
+  }
+});
+
 app.post('/batches/:id/rerun', async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ error: 'invalid_id' });
