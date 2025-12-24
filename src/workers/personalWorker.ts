@@ -24,7 +24,13 @@ async function processMaster(masterId: number) {
   const vr = await query<{ outcome: string | null; category: string | null }>('SELECT outcome, category FROM validation_results WHERE master_id=$1 ORDER BY validated_at DESC LIMIT 1', [masterId]);
   if (vr.rows.length === 0) return;
   const outcome = String(vr.rows[0].outcome || '').toLowerCase();
-  const category = String(vr.rows[0].category || '').toLowerCase();
+  let category = String(vr.rows[0].category || '').toLowerCase();
+
+  // Force category to personal if domain is in public_provider_domains
+  if (await isPublicDomain(domain)) {
+    category = 'personal';
+  }
+
   const submitterQ = await query<{ submitter_uuid: string | null }>('SELECT submitter_uuid FROM batches WHERE batch_id=$1', [batch_id]);
   const submitterUuid = submitterQ.rows[0]?.submitter_uuid || null;
   const roleQ = submitterUuid ? await query<{ role: string | null }>('SELECT role FROM profiles WHERE id=$1', [submitterUuid]) : { rows: [] } as any;
