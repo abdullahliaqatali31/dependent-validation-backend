@@ -26,7 +26,9 @@ async function run() {
       SELECT fbe.batch_id, fbe.master_id, fbe.email, fbe.domain, fbe.outcome, fbe.is_free_pool, fbe.created_at
       FROM final_business_emails fbe
       JOIN public_provider_domains ppd ON LOWER(fbe.domain) = LOWER(ppd.domain)
-      ON CONFLICT (master_id) DO NOTHING
+      WHERE NOT EXISTS (
+        SELECT 1 FROM final_personal_emails fpe WHERE fpe.master_id = fbe.master_id
+      )
     `);
     console.log(`Inserted ${moveResult.rowCount} rows into final_personal_emails.`);
 
