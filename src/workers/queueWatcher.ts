@@ -156,11 +156,13 @@ async function checkAndResume() {
                         const existing = await q.getJob(jobId);
                         if (existing) {
                             const state = await existing.getState();
-                            if (state === 'failed') {
-                                // If failed, remove it so we can re-add (retry)
+                            if (state === 'failed' || state === 'completed') {
+                                // If failed, or completed but we are here (meaning DB missing result), 
+                                // it's a zombie/ghost job. Remove and re-queue.
+                                console.log(`[QueueWatcher] Found ${state} job ${jobId} without DB result. Removing to retry.`);
                                 try { await existing.remove(); } catch {}
                             } else {
-                                // waiting, active, delayed, completed, etc.
+                                // waiting, active, delayed
                                 shouldAdd = false;
                             }
                             // If we found the job, we don't need to check other queues
