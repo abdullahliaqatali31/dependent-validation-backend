@@ -59,6 +59,36 @@ function requireAdmin(req: express.Request, res: express.Response): boolean {
   return true;
 }
 
+app.get('/system/health', async (req, res) => {
+  try {
+    const start = Date.now();
+    await query('SELECT 1');
+    const dbLatency = Date.now() - start;
+
+    const redisStart = Date.now();
+    await redis.ping();
+    const redisLatency = Date.now() - redisStart;
+
+    const uptime = process.uptime();
+    const memory = process.memoryUsage();
+
+    res.json({
+      status: 'ok',
+      uptime,
+      db_latency: dbLatency,
+      redis_latency: redisLatency,
+      memory: {
+        rss: Math.round(memory.rss / 1024 / 1024),
+        heapTotal: Math.round(memory.heapTotal / 1024 / 1024),
+        heapUsed: Math.round(memory.heapUsed / 1024 / 1024),
+      },
+      timestamp: new Date().toISOString()
+    });
+  } catch (err: any) {
+    res.status(500).json({ status: 'error', error: err.message });
+  }
+});
+
 app.post('/upload', async (req, res) => {
   try {
     const { emails, submitter_id, submitter_team_id, submitter_uuid: submitter_uuid_body } = req.body || {};
@@ -278,16 +308,40 @@ app.get('/employee/results/by-category', async (req, res) => {
     const employeeId = (req.query.employee_id || '').toString();
     if (!['business','personal'].includes(category) || !['accepted','catch_all','rejected','timeout'].includes(outcome)) return res.status(400).json({ error: 'invalid_params' });
     if (!batchId && !employeeId) return res.status(400).json({ error: 'missing_scope' });
-    let sql =
-      `SELECT me.email_normalized AS email,
-              COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason
-       FROM validation_results vr
-       JOIN master_emails me ON vr.master_id=me.id
-       WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false`;
+    
+    let sql = '';
     const params: any[] = [category, outcome];
-    if (batchId) { sql += ` AND me.batch_id=$3`; params.push(Number(batchId)); }
-    else { sql += ` AND me.submitter_uuid=$3`; params.push(employeeId); }
-    sql += ` ORDER BY vr.validated_at DESC LIMIT 2000`;
+
+    if (batchId) {
+      sql = `SELECT me.email_normalized AS email,
+                    COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason
+             FROM validation_results vr
+             JOIN master_emails me ON vr.master_id=me.id
+             WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.batch_id=$3
+             ORDER BY vr.validated_at DESC LIMIT 2000`;
+      params.push(Number(batchId));
+    } else {
+      // Employee view: include free pool
+      sql = `
+        SELECT email, reason FROM (
+          SELECT me.email_normalized AS email,
+                 COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason,
+                 vr.validated_at as ts
+          FROM validation_results vr
+          JOIN master_emails me ON vr.master_id=me.id
+          WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.submitter_uuid=$3
+          
+          UNION ALL
+          
+          SELECT email, NULL as reason, assigned_at as ts
+          FROM free_pool
+          WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true
+        ) as combined
+        ORDER BY ts DESC LIMIT 2000
+      `;
+      params.push(employeeId);
+    }
+    
     const rows = await query<{ email: string; reason: string | null }>(sql, params);
     res.json(rows.rows);
   } catch (err: any) {
@@ -765,6 +819,8 @@ app.get('/employee/validation-summary', async (req, res) => {
   try {
     const employeeId = String((req.query.employee_id || '').toString());
     if (!employeeId) return res.status(400).json({ error: 'missing_employee_id' });
+    
+    // Regular validation results
     const rows = await query(
       `SELECT vr.category, vr.outcome, COUNT(*) AS c
        FROM validation_results vr
@@ -773,14 +829,31 @@ app.get('/employee/validation-summary', async (req, res) => {
        GROUP BY vr.category, vr.outcome`,
       [employeeId]
     );
+
+    // Free pool assignments
+    const fpRows = await query(
+      `SELECT category, outcome, COUNT(*) AS c
+       FROM free_pool
+       WHERE assigned_to_uuid = $1 AND is_assigned = true
+       GROUP BY category, outcome`,
+      [employeeId]
+    );
+
     const result: any = { business: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0 }, personal: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0 } };
-    for (const r of rows.rows as any[]) {
-      const cat = String(r.category || '').toLowerCase();
-      const out = String(r.outcome || '').toLowerCase();
-      const count = Number(r.c || 0);
-      if (cat === 'business' && result.business[out] !== undefined) result.business[out] = count;
-      if (cat === 'personal' && result.personal[out] !== undefined) result.personal[out] = count;
-    }
+    
+    const merge = (list: any[]) => {
+      for (const r of list) {
+        const cat = String(r.category || '').toLowerCase();
+        const out = String(r.outcome || '').toLowerCase();
+        const count = Number(r.c || 0);
+        if (cat === 'business' && result.business[out] !== undefined) result.business[out] += count;
+        if (cat === 'personal' && result.personal[out] !== undefined) result.personal[out] += count;
+      }
+    };
+
+    merge(rows.rows);
+    merge(fpRows.rows);
+
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: 'employee_validation_summary_failed', details: err.message });
@@ -813,6 +886,35 @@ app.get('/employee/split-summary', async (req, res) => {
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: 'employee_split_summary_failed', details: err.message });
+  }
+});
+
+app.get('/employee/filtration-summary', async (req, res) => {
+  try {
+    const employeeId = String((req.query.employee_id || '').toString());
+    if (!employeeId) return res.status(400).json({ error: 'missing_employee_id' });
+
+    const rows = await query(
+      `SELECT fe.status, COUNT(*) AS c
+       FROM filtered_emails fe
+       JOIN master_emails me ON fe.master_id = me.id
+       WHERE me.submitter_uuid = $1
+       GROUP BY fe.status`,
+      [employeeId]
+    );
+
+    const result: any = { clean: 0, repaired: 0, removed: 0, details: {} };
+    for (const r of rows.rows as any[]) {
+      const status = String(r.status || '').toLowerCase();
+      const count = Number(r.c || 0);
+      if (status === 'clean') result.clean += count;
+      else if (status.startsWith('repaired')) result.repaired += count;
+      else if (status.startsWith('removed')) result.removed += count;
+      result.details[status] = count;
+    }
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: 'employee_filtration_summary_failed', details: err.message });
   }
 });
 
@@ -1704,6 +1806,22 @@ app.get('/free-pool/assignments', async (req, res) => {
     res.json(rows.rows);
   } catch (err: any) {
     res.status(500).json({ error: 'free_pool_assignments_failed', details: err.message });
+  }
+});
+
+// Free pool assignment history (Global/All Employees)
+app.get('/collection/free-pool/history', async (_req, res) => {
+  try {
+    const rows = await query(
+      `SELECT fpa.*, p.full_name, p.email
+       FROM free_pool_assignments fpa
+       LEFT JOIN profiles p ON fpa.employee_uuid::uuid = p.id
+       ORDER BY fpa.created_at DESC
+       LIMIT 100`
+    );
+    res.json(rows.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: 'collection_free_pool_history_failed', details: err.message });
   }
 });
 
