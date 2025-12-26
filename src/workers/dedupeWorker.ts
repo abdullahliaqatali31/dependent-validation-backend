@@ -66,6 +66,15 @@ async function processBatch(batchId: number) {
   }
   const masterCountQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails WHERE batch_id=$1', [batchId]);
   const masterCount = Number(masterCountQ.rows[0]?.c || 0);
+
+  // If we had input emails but resulted in 0 unique emails, mark batch as duplicate
+  if (masterCount === 0 && total > 0) {
+      await query('UPDATE batches SET status=$1, completed_at=NOW() WHERE batch_id=$2', ['duplicate', batchId]);
+      await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'duplicate_error', processed: 0, total: total });
+      console.log(`[DedupeWorker] Batch ${batchId} marked as duplicate (all emails were duplicates)`);
+      return;
+  }
+
   await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'dedupe_complete', processed: masterCount, total: masterCount });
 }
 

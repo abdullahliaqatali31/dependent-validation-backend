@@ -27,7 +27,7 @@ async function checkAndResume() {
       `SELECT DISTINCT met.batch_id 
        FROM master_emails_temp met
        JOIN batches b ON b.batch_id = met.batch_id
-       WHERE b.status NOT IN ('completed', 'cancelled')`
+       WHERE b.status NOT IN ('completed', 'cancelled', 'duplicate')`
     );
     
     for (const row of stuckDedupe.rows) {
@@ -53,7 +53,7 @@ async function checkAndResume() {
        JOIN batches b ON b.batch_id = me.batch_id
        LEFT JOIN filtered_emails fe ON fe.master_id = me.id 
        WHERE fe.id IS NULL 
-         AND b.status NOT IN ('completed', 'cancelled')
+         AND b.status NOT IN ('completed', 'cancelled', 'duplicate')
        LIMIT 50` 
     );
 
@@ -90,7 +90,7 @@ async function checkAndResume() {
          LEFT JOIN validation_results vr ON vr.master_id = me.id
          WHERE fe.status NOT LIKE 'removed:%'
            AND vr.master_id IS NULL
-           AND b.status NOT IN ('completed', 'cancelled')
+           AND b.status NOT IN ('completed', 'cancelled', 'duplicate')
          LIMIT 50`
     );
 
