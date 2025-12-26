@@ -10,8 +10,8 @@ const CHUNK_SIZE = 1000;
 
 async function processBatch(batchId: number) {
   // Load submitter identity once from the batch
-  const b = await query<{ submitter_id: number | null; submitter_uuid: string | null; submitter_team_id: number | null }>(
-    'SELECT submitter_id, submitter_uuid, submitter_team_id FROM batches WHERE batch_id=$1',
+  const b = await query<{ submitter_id: number | null; submitter_uuid: string | null; submitter_team_id: number | null; total_count: number }>(
+    'SELECT submitter_id, submitter_uuid, submitter_team_id, total_count FROM batches WHERE batch_id=$1',
     [batchId]
   );
   if (b.rows.length === 0) {
@@ -27,6 +27,7 @@ async function processBatch(batchId: number) {
   const submitter_id = (b.rows[0]?.submitter_id ?? null) as number | null;
   const submitter_uuid = (b.rows[0]?.submitter_uuid ?? null) as string | null;
   const submitter_team_id = (b.rows[0]?.submitter_team_id ?? null) as number | null;
+  const batchTotal = Number(b.rows[0]?.total_count || 0);
   const totalQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails_temp WHERE batch_id=$1', [batchId]);
   const total = Number(totalQ.rows[0]?.c || 0);
 
@@ -68,9 +69,9 @@ async function processBatch(batchId: number) {
   const masterCount = Number(masterCountQ.rows[0]?.c || 0);
 
   // If we had input emails but resulted in 0 unique emails, mark batch as duplicate
-  if (masterCount === 0 && total > 0) {
+  if (masterCount === 0 && batchTotal > 0) {
       await query('UPDATE batches SET status=$1, completed_at=NOW() WHERE batch_id=$2', ['duplicate', batchId]);
-      await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'duplicate_error', processed: 0, total: total });
+      await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'Duplicate', processed: batchTotal, total: batchTotal });
       console.log(`[DedupeWorker] Batch ${batchId} marked as duplicate (all emails were duplicates)`);
       return;
   }
