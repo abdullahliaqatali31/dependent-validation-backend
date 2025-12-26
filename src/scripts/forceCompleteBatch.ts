@@ -1,47 +1,39 @@
 
 import { query } from '../db';
-import { releaseBatchAssignment } from '../utils/validationAssignment';
-import { redis } from '../redis';
+import { redis, publish, CHANNELS } from '../redis';
 
-async function main() {
-  const batchId = process.argv[2] ? Number(process.argv[2]) : null;
-
+async function forceComplete() {
+  const batchId = process.argv[2];
   if (!batchId) {
-    console.error('Usage: ts-node forceCompleteBatch.ts <batchId>');
+    console.error('Usage: npx ts-node src/scripts/forceCompleteBatch.ts <BATCH_ID>');
     process.exit(1);
   }
 
-  console.log(`[ForceComplete] Forcing completion for batch ${batchId}...`);
+  const id = Number(batchId);
+  console.log(`Forcing completion for Batch ${id}...`);
 
-  try {
-    // 1. Update DB status
-    console.log('[ForceComplete] Updating DB status to "completed"...');
-    await query('UPDATE batches SET status=$1, updated_at=NOW() WHERE batch_id=$2', ['completed', batchId]);
-    
-    // 2. Release Redis locks
-    console.log('[ForceComplete] Releasing Redis locks...');
-    await releaseBatchAssignment(batchId);
+  // 1. Update status in DB
+  await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [id, 'completed']);
 
-    // 3. Verify
-    const res = await query('SELECT status FROM batches WHERE batch_id=$1', [batchId]);
-    const active = await redis.get('val:active_batch_id');
-
-    console.log('-----------------------------------');
-    console.log(`Batch ${batchId} status: ${res.rows[0]?.status}`);
-    console.log(`Active Validation Batch (Redis): ${active}`);
-    console.log('-----------------------------------');
-
-    if (active && Number(active) === batchId) {
-        console.warn('WARNING: Redis lock still exists!');
-    } else {
-        console.log('SUCCESS: Batch completed and locks released.');
-    }
-
-  } catch (e) {
-    console.error('[ForceComplete] Error:', e);
-  } finally {
-    process.exit(0);
+  // 2. Clear any active locks in Redis
+  const activeBatch = await redis.get('val:active_batch_id');
+  if (activeBatch && Number(activeBatch) === id) {
+    console.log('Releasing active batch lock...');
+    await redis.del('val:active_batch_id');
   }
+
+  // 3. Notify Frontend
+  console.log('Publishing completion event...');
+  await publish(CHANNELS.batchProgress, { 
+    batchId: id, 
+    step: 'done', 
+    stage: 'completed',
+    processed: 100, 
+    total: 100 
+  });
+
+  console.log(`Batch ${id} marked as COMPLETED.`);
+  process.exit(0);
 }
 
-main();
+forceComplete().catch(console.error);
