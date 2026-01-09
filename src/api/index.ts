@@ -121,40 +121,58 @@ app.post('/upload', async (req, res) => {
   }
 });
 
+async function getBatchCounts(batchId: number) {
+  const cacheKey = `batch:counts:${batchId}`;
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch {}
+  }
+
+  const staged = await query('SELECT COUNT(*) FROM master_emails_temp WHERE batch_id=$1', [batchId]);
+  const master = await query('SELECT COUNT(*) FROM master_emails WHERE batch_id=$1', [batchId]);
+  const filtered = await query('SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1', [batchId]);
+  const filtered_rules = await query(
+      `SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1 AND status LIKE 'removed:%'`,
+      [batchId]
+  );
+  const filtered_unsub = await query(
+      `SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1 AND reason='unsubscribed'`,
+      [batchId]
+  );
+  const personal = await query('SELECT COUNT(*) FROM personal_emails pe JOIN master_emails me ON pe.master_id=me.id WHERE me.batch_id=$1', [batchId]);
+  const validated = await query('SELECT COUNT(*) FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1', [batchId]);
+
+  const counts = {
+    staged: Number(staged.rows[0].count || 0),
+    master: Number(master.rows[0].count || 0),
+    filtered: Number(filtered.rows[0].count || 0),
+    filtered_rules: Number(filtered_rules.rows[0].count || 0),
+    filtered_unsub: Number(filtered_unsub.rows[0].count || 0),
+    personal: Number(personal.rows[0].count || 0),
+    validated: Number(validated.rows[0].count || 0)
+  };
+
+  await redis.set(cacheKey, JSON.stringify(counts), 'EX', 5);
+  return counts;
+}
+
 app.get('/batches/:id', async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ error: 'invalid_id' });
   try {
     const b = await query('SELECT * FROM batches WHERE batch_id=$1', [id]);
-    const staged = await query('SELECT COUNT(*) FROM master_emails_temp WHERE batch_id=$1', [id]);
-    const master = await query('SELECT COUNT(*) FROM master_emails WHERE batch_id=$1', [id]);
-    const filtered = await query('SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1', [id]);
-    const filtered_rules = await query(
-      `SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1 AND status LIKE 'removed:%'`,
-      [id]
-    );
-    const filtered_unsub = await query(
-      `SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1 AND reason='unsubscribed'`,
-      [id]
-    );
-    const personal = await query('SELECT COUNT(*) FROM personal_emails pe JOIN master_emails me ON pe.master_id=me.id WHERE me.batch_id=$1', [id]);
-    const validated = await query('SELECT COUNT(*) FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1', [id]);
+    const counts = await getBatchCounts(id);
     const total = Number((b.rows[0]?.total_count ?? 0) as number);
-    const stagedCount = Number(staged.rows[0].count || 0);
-    const masterCount = Number(master.rows[0].count || 0);
-    // Duplicates are emails that have been processed from staging but not inserted into master
-    // This formula remains 0 before dedupe runs (staged === total), and equals (total - master) once dedupe completes.
-    const duplicates = Math.max(0, total - stagedCount - masterCount);
+    
+    // Duplicates calculation
+    const duplicates = Math.max(0, total - counts.staged - counts.master);
+    
     res.json({
       batch: b.rows[0] || null,
       counts: {
-        staged: stagedCount,
-        master: masterCount,
-        filtered: Number(filtered.rows[0].count || 0),
-        filtered_rules: Number(filtered_rules.rows[0].count || 0),
-        filtered_unsub: Number(filtered_unsub.rows[0].count || 0),
-        personal: Number(personal.rows[0].count || 0),
-        validated: Number(validated.rows[0].count || 0),
+        ...counts,
         duplicates
       }
     });
@@ -1198,52 +1216,65 @@ app.get('/employee/logs', async (req, res) => {
 });
 
 // Admin: batches list with progress stats
-app.get('/admin/batches', async (_req, res) => {
+app.get('/admin/batches', async (req, res) => {
   try {
-    const batches = await query('SELECT * FROM batches ORDER BY created_at DESC');
+    const limit = Number(req.query.limit || 20);
+    const offset = Number(req.query.offset || 0);
+    const submitter_id = req.query.submitter_id ? String(req.query.submitter_id) : null;
+    const submitter_uuid = req.query.submitter_uuid ? String(req.query.submitter_uuid) : null;
+    const status = req.query.status ? String(req.query.status) : null;
+    const from_date = req.query.from_date ? String(req.query.from_date) : null;
+    const to_date = req.query.to_date ? String(req.query.to_date) : null;
+
+    let queryStr = 'SELECT * FROM batches';
+    const params: any[] = [];
+    const conditions: string[] = [];
+
+    if (submitter_id) {
+      params.push(submitter_id);
+      conditions.push(`submitter_id = $${params.length}`);
+    }
+    if (submitter_uuid) {
+      params.push(submitter_uuid);
+      conditions.push(`submitter_uuid = $${params.length}`);
+    }
+    if (status) {
+      params.push(status);
+      conditions.push(`status = $${params.length}`);
+    }
+    if (from_date) {
+      params.push(from_date);
+      conditions.push(`created_at >= $${params.length}`);
+    }
+    if (to_date) {
+      params.push(to_date);
+      conditions.push(`created_at <= $${params.length}`);
+    }
+
+    if (conditions.length > 0) {
+      queryStr += ' WHERE ' + conditions.join(' AND ');
+    }
+
+    queryStr += ' ORDER BY created_at DESC';
+    
+    // Always apply limit/offset
+    params.push(limit);
+    queryStr += ` LIMIT $${params.length}`;
+    
+    params.push(offset);
+    queryStr += ` OFFSET $${params.length}`;
+
+    const batches = await query(queryStr, params);
     const result = [] as any[];
     for (const b of batches.rows as any[]) {
       const id = b.batch_id;
-      const staged = await query('SELECT COUNT(*) FROM master_emails_temp WHERE batch_id=$1', [id]);
-      const master = await query('SELECT COUNT(*) FROM master_emails WHERE batch_id=$1', [id]);
-      const filtered = await query('SELECT COUNT(*) FROM filter_emails fe JOIN master_emails me ON fe.master_id=me.id WHERE me.batch_id=$1', [id]);
-      const filtered_rules = await query(
-        `SELECT COUNT(*)
-         FROM filter_emails fe
-         JOIN master_emails me ON fe.master_id = me.id
-         WHERE me.batch_id = $1
-           AND (
-             COALESCE((fe.filter_flags->>'domain')::boolean, false)
-             OR COALESCE((fe.filter_flags->>'contains')::boolean, false)
-             OR COALESCE((fe.filter_flags->>'endswith')::boolean, false)
-             OR COALESCE((fe.filter_flags->>'excluded')::boolean, false)
-           )`,
-        [id]
-      );
-      const filtered_unsub = await query(
-        `SELECT COUNT(*)
-         FROM filter_emails fe
-         JOIN master_emails me ON fe.master_id = me.id
-         WHERE me.batch_id = $1
-           AND COALESCE((fe.filter_flags->>'unsubscribed')::boolean, false)`,
-        [id]
-      );
-      const personal = await query('SELECT COUNT(*) FROM personal_emails pe JOIN master_emails me ON pe.master_id=me.id WHERE me.batch_id=$1', [id]);
-      const validated = await query('SELECT COUNT(*) FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1', [id]);
+      const counts = await getBatchCounts(id);
       const total = Number((b?.total_count ?? 0) as number);
-      const stagedCount = Number(staged.rows[0].count || 0);
-      const masterCount = Number(master.rows[0].count || 0);
-      const duplicates = Math.max(0, total - stagedCount - masterCount);
+      const duplicates = Math.max(0, total - counts.staged - counts.master);
       result.push({
         batch: b,
         counts: {
-          staged: stagedCount,
-          master: masterCount,
-          filtered: Number(filtered.rows[0].count || 0),
-          filtered_rules: Number(filtered_rules.rows[0].count || 0),
-          filtered_unsub: Number(filtered_unsub.rows[0].count || 0),
-          personal: Number(personal.rows[0].count || 0),
-          validated: Number(validated.rows[0].count || 0),
+          ...counts,
           duplicates
         }
       });
