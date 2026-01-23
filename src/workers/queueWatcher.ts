@@ -186,6 +186,58 @@ async function checkAndResume() {
         }
     }
 
+    // 4.5 Monitor Active Batch Progress (Auto-complete if stuck/idle > 15m)
+    const activeBatchId = await redis.get('val:active_batch_id');
+    if (activeBatchId) {
+        const bId = Number(activeBatchId);
+        
+        // Check if batch is valid and not paused
+        const bCheck = await query<{ status: string }>('SELECT status FROM batches WHERE batch_id=$1', [bId]);
+        const status = String(bCheck.rows[0]?.status || '').toLowerCase();
+        
+        if (status !== 'paused' && status !== 'completed' && status !== 'cancelled') {
+             const doneQ = await query<{ count: string }>('SELECT COUNT(*) FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1', [bId]);
+             const totalQ = await query<{ count: string }>(
+                `SELECT COUNT(*) 
+                 FROM filtered_emails fe 
+                 JOIN master_emails me ON fe.master_id = me.id 
+                 WHERE me.batch_id=$1 AND fe.status NOT LIKE 'removed:%'`, 
+                [bId]
+             );
+             
+             const done = Number(doneQ.rows[0]?.count || 0);
+             const total = Number(totalQ.rows[0]?.count || 0);
+             
+             const redisKey = `queue_watcher:val_progress:${bId}`;
+             const cached = await redis.get(redisKey);
+             
+             if (cached) {
+                const last = JSON.parse(cached);
+                if (done > last.count) {
+                    // Making progress
+                    await redis.set(redisKey, JSON.stringify({ count: done, lastChange: Date.now() }), 'EX', 3600);
+                } else {
+                    // No progress
+                    const stalledMs = Date.now() - last.lastChange;
+                    if (stalledMs > 15 * 60 * 1000) { // 15 minutes
+                        console.log(`[QueueWatcher] Active batch ${bId} stalled for >15m (done=${done}/${total}). Force completing.`);
+                        
+                        await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [bId, 'completed']);
+                        await releaseBatchAssignment(bId);
+                        await redis.del(redisKey);
+                        
+                        affectedBatches.add(bId);
+                        activity.stuck_validation_force_complete = (activity.stuck_validation_force_complete || 0) + 1;
+                    }
+                }
+             } else {
+                await redis.set(redisKey, JSON.stringify({ count: done, lastChange: Date.now() }), 'EX', 3600);
+             }
+        } else if (status === 'completed' || status === 'cancelled') {
+             await redis.del(`queue_watcher:val_progress:${bId}`);
+        }
+    }
+
     // 5. Stuck Split (Validated but not in final tables)
     const stuckSplit = await query<{ batch_id: number }>(
         `SELECT DISTINCT me.batch_id

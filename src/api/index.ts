@@ -332,7 +332,8 @@ app.get('/employee/results/by-category', async (req, res) => {
 
     if (batchId) {
       sql = `SELECT me.email_normalized AS email,
-                    COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason
+                    COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason,
+                    vr.ninja_key_used AS key
              FROM validation_results vr
              JOIN master_emails me ON vr.master_id=me.id
              WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.batch_id=$3
@@ -341,9 +342,10 @@ app.get('/employee/results/by-category', async (req, res) => {
     } else {
       // Employee view: include free pool
       sql = `
-        SELECT email, reason FROM (
+        SELECT email, reason, key FROM (
           SELECT me.email_normalized AS email,
                  COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason,
+                 vr.ninja_key_used AS key,
                  vr.validated_at as ts
           FROM validation_results vr
           JOIN master_emails me ON vr.master_id=me.id
@@ -351,7 +353,7 @@ app.get('/employee/results/by-category', async (req, res) => {
           
           UNION ALL
           
-          SELECT email, NULL as reason, assigned_at as ts
+          SELECT email, NULL as reason, NULL as key, assigned_at as ts
           FROM free_pool
           WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true
         ) as combined
@@ -360,7 +362,7 @@ app.get('/employee/results/by-category', async (req, res) => {
       params.push(employeeId);
     }
     
-    const rows = await query<{ email: string; reason: string | null }>(sql, params);
+    const rows = await query<{ email: string; reason: string | null; key: string | null }>(sql, params);
     res.json(rows.rows);
   } catch (err: any) {
     res.status(500).json({ error: 'employee_results_by_category_failed', details: err.message });
