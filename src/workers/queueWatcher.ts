@@ -186,58 +186,6 @@ async function checkAndResume() {
         }
     }
 
-    // 4.5 Monitor Active Batch Progress (Auto-complete if stuck/idle > 15m)
-    const activeBatchId = await redis.get('val:active_batch_id');
-    if (activeBatchId) {
-        const bId = Number(activeBatchId);
-        
-        // Check if batch is valid and not paused
-        const bCheck = await query<{ status: string }>('SELECT status FROM batches WHERE batch_id=$1', [bId]);
-        const status = String(bCheck.rows[0]?.status || '').toLowerCase();
-        
-        if (status !== 'paused' && status !== 'completed' && status !== 'cancelled') {
-             const doneQ = await query<{ count: string }>('SELECT COUNT(*) FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1', [bId]);
-             const totalQ = await query<{ count: string }>(
-                `SELECT COUNT(*) 
-                 FROM filtered_emails fe 
-                 JOIN master_emails me ON fe.master_id = me.id 
-                 WHERE me.batch_id=$1 AND fe.status NOT LIKE 'removed:%'`, 
-                [bId]
-             );
-             
-             const done = Number(doneQ.rows[0]?.count || 0);
-             const total = Number(totalQ.rows[0]?.count || 0);
-             
-             const redisKey = `queue_watcher:val_progress:${bId}`;
-             const cached = await redis.get(redisKey);
-             
-             if (cached) {
-                const last = JSON.parse(cached);
-                if (done > last.count) {
-                    // Making progress
-                    await redis.set(redisKey, JSON.stringify({ count: done, lastChange: Date.now() }), 'EX', 3600);
-                } else {
-                    // No progress
-                    const stalledMs = Date.now() - last.lastChange;
-                    if (stalledMs > 15 * 60 * 1000) { // 15 minutes
-                        console.log(`[QueueWatcher] Active batch ${bId} stalled for >15m (done=${done}/${total}). Force completing.`);
-                        
-                        await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [bId, 'completed']);
-                        await releaseBatchAssignment(bId);
-                        await redis.del(redisKey);
-                        
-                        affectedBatches.add(bId);
-                        activity.stuck_validation_force_complete = (activity.stuck_validation_force_complete || 0) + 1;
-                    }
-                }
-             } else {
-                await redis.set(redisKey, JSON.stringify({ count: done, lastChange: Date.now() }), 'EX', 3600);
-             }
-        } else if (status === 'completed' || status === 'cancelled') {
-             await redis.del(`queue_watcher:val_progress:${bId}`);
-        }
-    }
-
     // 5. Stuck Split (Validated but not in final tables)
     const stuckSplit = await query<{ batch_id: number }>(
         `SELECT DISTINCT me.batch_id
@@ -279,6 +227,73 @@ async function checkAndResume() {
         }
     }
     
+    // 6. Idle System Check (Auto-complete stuck batches if 15 mins of no activity)
+    let totalPendingJobs = 0;
+    const queuesToCheck = [dedupeQueue, filterQueue, personalQueue, ...(validationQueues || [])];
+    
+    for (const q of queuesToCheck) {
+        if (!q) continue;
+        try {
+            const counts = await q.getJobCounts();
+            totalPendingJobs += (counts.waiting || 0) + (counts.active || 0) + (counts.delayed || 0);
+        } catch (e) {
+            console.warn('[QueueWatcher] Failed to get job counts', e);
+        }
+    }
+
+    const totalRecovered = (activity.stuck_dedupe || 0) + (activity.stuck_filter || 0) + (activity.stuck_validation || 0) + (activity.stuck_split || 0);
+    
+    // Check Redis for consecutive idle minutes
+    const IDLE_KEY = 'queue_watcher:idle_minutes';
+    let idleMinutes = Number(await redis.get(IDLE_KEY) || 0);
+
+    if (totalPendingJobs === 0 && totalRecovered === 0) {
+        idleMinutes++;
+        await redis.set(IDLE_KEY, String(idleMinutes));
+        if (idleMinutes >= 5) {
+             console.log(`[QueueWatcher] System idle for ${idleMinutes} minute(s). (Jobs: 0, Recovered: 0)`);
+        }
+    } else {
+        if (idleMinutes > 0) {
+            console.log(`[QueueWatcher] System activity detected (Jobs: ${totalPendingJobs}, Recovered: ${totalRecovered}). Resetting idle timer.`);
+        }
+        idleMinutes = 0;
+        await redis.set(IDLE_KEY, '0');
+    }
+
+    if (idleMinutes >= 15) {
+        // Only target the batch that is causing a blockage
+        const activeBatchId = await redis.get('val:active_batch_id');
+        
+        if (activeBatchId) {
+            const bId = Number(activeBatchId);
+            console.log(`[QueueWatcher] System idle for 15+ mins AND batch ${bId} is holding lock. Force completing it.`);
+            
+            const b = await query<{ status: string }>('SELECT status FROM batches WHERE batch_id=$1', [bId]);
+            const status = b.rows[0]?.status || 'unknown';
+
+            // Mark as completed
+            await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [bId, 'completed']);
+            
+            // Release lock
+            await releaseBatchAssignment(bId);
+            
+            // Log
+             try {
+                await query('INSERT INTO audit_logs(action_type, details, resource_ref) VALUES ($1, $2, $3)', [
+                    'system_force_complete',
+                    JSON.stringify({ reason: '15_min_idle_blocking', prev_status: status }),
+                    String(bId)
+                ]);
+            } catch {}
+        } else {
+             console.log('[QueueWatcher] System idle for 15+ mins, but no blocking batch found (val:active_batch_id is empty). No action taken.');
+        }
+        
+        // Reset counter after action
+        await redis.set(IDLE_KEY, '0');
+    }
+
     activity.batches_affected = Array.from(affectedBatches);
     await logWatcherActivity(activity);
 
