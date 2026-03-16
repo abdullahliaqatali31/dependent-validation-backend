@@ -4,6 +4,8 @@ import { config } from './config';
 export const redis = new Redis(config.redisUrl, {
   maxRetriesPerRequest: null,
   enableReadyCheck: true,
+  connectTimeout: 30000, // 30 seconds
+  keepAlive: 10000,     // 10 seconds
   retryStrategy: (times: number) => Math.min(times * 500, 10000),
   autoResubscribe: true
 });

@@ -70,7 +70,7 @@ async function processJob(masterId: number, key: string, workerId: string, worke
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase()
   if (paused && pausedStage === 'validation') {
     const q = validationQueues[workerIdx] || validationQueues[0]
-    try { await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false, delay: 15000 }) } catch {}
+    try { await q.add('validateEmail', { masterId }, { removeOnComplete: true, removeOnFail: true, delay: 15000 }) } catch {}
     await publish(CHANNELS.batchProgress, { batchId, stage: 'validation', status: 'paused', master_id: masterId })
     return
   }
@@ -218,8 +218,8 @@ console.log('validationMulti workers started')
               if (destQ) {
                 await destQ.add('validateEmail', { masterId: mid }, { 
                   jobId: oldJobId || `val-${mid}`,
-                  removeOnComplete: false, 
-                  removeOnFail: false 
+                  removeOnComplete: true, 
+                  removeOnFail: true 
                 })
               }
             }

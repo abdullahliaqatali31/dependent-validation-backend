@@ -98,7 +98,7 @@ async function validateMaster(masterId: number) {
       const total = Number(totalQ.rows[0]?.count || 0);
       const done = Number(doneQ.rows[0]?.count || 0);
       await publish(CHANNELS.batchProgress, { batchId, step: 'validation', stage: 'validation', processed: done, total });
-      await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: false, removeOnFail: false });
+      await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: true, removeOnFail: true });
     } catch {}
     return;
   }
@@ -139,7 +139,7 @@ async function validateMaster(masterId: number) {
         await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [batchId, 'completed']);
         await publish(CHANNELS.batchProgress, { batchId, step: 'done', stage: 'completed', processed: done, total });
       }
-      await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: false, removeOnFail: false });
+      await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: true, removeOnFail: true });
     } catch {}
   } catch (e) {
     try {

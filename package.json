@@ -19,6 +19,7 @@
     "reset:redis": "ts-node src/scripts/flushRedis.ts",
     "unstick:batch": "ts-node-dev --transpile-only src/scripts/unstickBatch.ts",
     "test:ninja": "ts-node-dev --transpile-only src/scripts/testNinja.ts",
+    "clean:jobs": "ts-node-dev --transpile-only src/scripts/clearFinishedJobs.ts",
     "dev": "npm run api",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/api/index.js",

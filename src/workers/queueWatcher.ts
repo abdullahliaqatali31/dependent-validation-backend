@@ -77,6 +77,7 @@ async function checkAndResume() {
                     removeOnComplete: true,
                     removeOnFail: true
                 });
+                await sleep(50); // Give Redis a breather
             }
         }
     }
@@ -178,9 +179,10 @@ async function checkAndResume() {
                     const q = validationQueues[idx] || validationQueues[0];
                     await q.add('validateEmail', { masterId: m.id }, {
                         jobId, 
-                        removeOnComplete: false, 
-                        removeOnFail: false
+                        removeOnComplete: true, 
+                        removeOnFail: true
                     });
+                    await sleep(50); // Give Redis a breather
                 }
             }
         }
@@ -223,6 +225,7 @@ async function checkAndResume() {
                     removeOnComplete: true,
                     removeOnFail: true
                 });
+                await sleep(50); // Give Redis a breather
             }
         }
     }

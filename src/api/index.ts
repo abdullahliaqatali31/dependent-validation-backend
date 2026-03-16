@@ -650,7 +650,7 @@ app.post('/batches/:id/unstick', async (req, res) => {
       for (const r of valPending.rows) {
         const idx = await assignWorkerRoundRobin(id);
         const q = validationQueues[idx] || validationQueues[0];
-        await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: false, removeOnFail: false });
+        await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
         valEnq++;
       }
     }
@@ -2021,7 +2021,7 @@ app.post('/admin/validation/rebalance', async (req, res) => {
         const toIdx = await assignWorkerRoundRobin(batchId);
         const destQ = queues[toIdx] || queues[0];
         if (destQ) {
-          await destQ.add('validateEmail', { masterId: mid }, { removeOnComplete: false, removeOnFail: false });
+          await destQ.add('validateEmail', { masterId: mid }, { removeOnComplete: true, removeOnFail: true });
           moved++;
         }
       }
