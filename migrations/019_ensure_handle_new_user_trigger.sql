@@ -1,7 +1,7 @@
 -- Migration 019: Re-ensure the handle_new_user trigger is active on the live DB.
--- This is idempotent — safe to run even if already applied.
--- The trigger auto-creates a profiles row whenever a new auth.users row is inserted,
--- acting as a second safety net alongside the explicit upsert in POST /admin/users.
+-- NOTE: This migration is skipped by backend/src/migrate.ts if the 'auth' schema 
+-- is not found (common in local Postgres or secondary app servers).
+-- It is primarily intended for the primary Supabase database.
 
 DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 CREATE TRIGGER on_auth_user_created

@@ -15,7 +15,8 @@ async function run() {
     '003_role_policies.sql',
     '004_profiles_backfill.sql',
     '005_profiles_admin_override.sql',
-    '018_ensure_profiles_trigger.sql'
+    '018_ensure_profiles_trigger.sql',
+    '019_ensure_handle_new_user_trigger.sql'
   ]);
   if (!supabaseEnabled) {
     const before = files.slice();
