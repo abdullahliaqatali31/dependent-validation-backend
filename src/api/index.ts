@@ -1453,11 +1453,18 @@ app.post('/admin/users', async (req, res) => {
     });
     if (cErr) throw cErr;
     const userId = created?.user?.id as string;
-    // Mirror role into profiles immediately for server-side reads
-    if (normalizedRole) {
-      await query('UPDATE profiles SET role=$2, updated_at=now() WHERE id=$1', [userId, normalizedRole]);
-    }
-    // Return profile row (trigger should have inserted on user create; fallback select)
+    // Mirror role and profile details into profiles table immediately
+    await query(
+      `INSERT INTO profiles(id, email, full_name, role)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (id) DO UPDATE SET
+         email      = EXCLUDED.email,
+         full_name  = EXCLUDED.full_name,
+         role       = EXCLUDED.role,
+         updated_at = now()`,
+      [userId, email, full_name || null, normalizedRole || 'employee']
+    );
+    // Return profile row
     const prof = await query('SELECT id, email, full_name, avatar_url, role, created_at, updated_at FROM profiles WHERE id=$1', [userId]);
     await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['admin_user_create', null, JSON.stringify({ id: userId, email })]);
     res.json({ user_id: userId, profile: prof.rows[0] || null });
@@ -2118,89 +2125,6 @@ app.get('/admin/validation/pending', async (_req, res) => {
     res.status(500).json({ error: 'admin_validation_pending_failed', details: err.message });
   }
 });
-// ─── Admin: User Management ───────────────────────────────────────────────────
-
-// GET /admin/users — list all users from the profiles table
-app.get('/admin/users', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  try {
-    const rows = await query<{
-      id: string;
-      email: string | null;
-      full_name: string | null;
-      avatar_url: string | null;
-      role: string;
-      created_at: string;
-      updated_at: string;
-    }>(
-      `SELECT id, email, full_name, avatar_url, role, created_at, updated_at
-       FROM profiles
-       ORDER BY created_at DESC`
-    );
-    res.json(rows.rows);
-  } catch (err: any) {
-    res.status(500).json({ error: 'admin_users_list_failed', details: err.message });
-  }
-});
-
-// POST /admin/users — create a Supabase auth user and immediately upsert into profiles
-app.post('/admin/users', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  if (!supabaseAdmin) return res.status(503).json({ error: 'supabase_not_configured' });
-  const { email, password, full_name, role } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'email_and_password_required' });
-  const safeRole = (['admin', 'collector', 'employee'] as const).includes(role) ? role : 'employee';
-  try {
-    const { data, error } = await supabaseAdmin.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      app_metadata: { role: safeRole },
-      user_metadata: { full_name: full_name || null },
-    });
-    if (error) throw error;
-    const uid = data.user?.id;
-    if (uid) {
-      // Immediately upsert the profile row so it appears in /admin/users without
-      // waiting for the handle_new_user DB trigger to propagate.
-      await query(
-        `INSERT INTO profiles(id, email, full_name, role)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (id) DO UPDATE SET
-           email      = EXCLUDED.email,
-           full_name  = EXCLUDED.full_name,
-           role       = EXCLUDED.role,
-           updated_at = now()`,
-        [uid, email, full_name || null, safeRole]
-      );
-    }
-    res.json({ ok: true, user: data.user });
-  } catch (err: any) {
-    res.status(500).json({ error: 'admin_user_create_failed', details: err.message });
-  }
-});
-
-// PUT /admin/users/:id/role — update role in both auth metadata and profiles table
-app.put('/admin/users/:id/role', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  if (!supabaseAdmin) return res.status(503).json({ error: 'supabase_not_configured' });
-  const { id } = req.params;
-  const { role } = req.body || {};
-  if (!(['admin', 'collector', 'employee'] as const).includes(role)) {
-    return res.status(400).json({ error: 'invalid_role' });
-  }
-  try {
-    const { error } = await supabaseAdmin.auth.admin.updateUserById(id, {
-      app_metadata: { role },
-    });
-    if (error) throw error;
-    await query(`UPDATE profiles SET role = $1, updated_at = now() WHERE id = $2`, [role, id]);
-    res.json({ ok: true });
-  } catch (err: any) {
-    res.status(500).json({ error: 'admin_role_update_failed', details: err.message });
-  }
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.delete('/batches/:id', async (req, res) => {

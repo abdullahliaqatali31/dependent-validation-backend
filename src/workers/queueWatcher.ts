@@ -3,8 +3,11 @@ import { query } from '../db';
 import { dedupeQueue, filterQueue, validationQueues, personalQueue } from '../queues';
 import { ensureBatchActivated, assignWorkerRoundRobin, releaseBatchAssignment } from '../utils/validationAssignment';
 import { redis } from '../redis';
+import { syncProfiles } from '../utils/syncUtils';
 
 const CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
+let iterations = 0;
+const SYNC_INTERVAL_ITERATIONS = 5; // Run sync every 5 minutes (5 * 1 minute)
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -18,10 +21,25 @@ async function logWatcherActivity(details: any) {
 
 async function checkAndResume() {
   console.log('[QueueWatcher] Checking for stuck batches...');
-  const activity: any = { stuck_dedupe: 0, stuck_filter: 0, stuck_validation: 0, stuck_split: 0, batches_affected: [] };
+  const activity: any = { stuck_dedupe: 0, stuck_filter: 0, stuck_validation: 0, stuck_split: 0, batches_affected: [], profile_sync: null };
   const affectedBatches = new Set<number>();
 
+  iterations++;
+  const shouldSync = iterations % SYNC_INTERVAL_ITERATIONS === 0;
+
   try {
+    if (shouldSync) {
+      console.log('[QueueWatcher] Running automatic profile sync...');
+      try {
+        const total = await syncProfiles();
+        activity.profile_sync = { success: true, count: total };
+        console.log(`[QueueWatcher] Automatic profile sync completed: ${total} profiles synced.`);
+      } catch (e: any) {
+        console.error('[QueueWatcher] Automatic profile sync failed:', e.message);
+        activity.profile_sync = { success: false, error: e.message };
+      }
+    }
+
     // 1. Stuck Dedupe (Batches with data in temp but not processing)
     const stuckDedupe = await query<{ batch_id: number }>(
       `SELECT DISTINCT met.batch_id 
