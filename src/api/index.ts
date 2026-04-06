@@ -10,9 +10,26 @@ import { createClient } from '@supabase/supabase-js';
 
 const app = express();
 // CORS: allow frontend dev origins and necessary headers/methods
-const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000').split(',').map(o => o.trim()).filter(Boolean);
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://localhost:3003',
+  'http://localhost:3004',
+  'http://localhost:3005',
+  ...(process.env.CORS_ORIGINS || '').split(',').map(o => o.trim()).filter(Boolean)
+];
+
 app.use(cors({
-  origin: allowedOrigins,
+  origin: (origin, callback) => {
+    // allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.startsWith('http://localhost:')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   methods: ['GET','POST','PUT','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization'],
   credentials: true
@@ -1391,13 +1408,22 @@ app.get('/admin/overview', async (_req, res) => {
     const valStats = await query(
       `SELECT 
          COUNT(*) AS total,
-         COUNT(*) FILTER (WHERE status_enum = 'deliverable') AS ok
+         COUNT(*) FILTER (WHERE status_enum = 'deliverable') AS ok,
+         COUNT(*) FILTER (WHERE outcome = 'accepted') AS accepted,
+         COUNT(*) FILTER (WHERE outcome = 'catch_all') AS catch_all,
+         COUNT(*) FILTER (WHERE outcome = 'rejected') AS rejected
        FROM validation_results`
     );
+    const freePool = await query('SELECT COUNT(*) FROM free_pool WHERE is_free_pool = true AND is_assigned = false');
     const employees = await query('SELECT COUNT(DISTINCT submitter_id) FROM batches WHERE submitter_id IS NOT NULL');
 
     const total = Number(valStats.rows[0]?.total || 0);
     const ok = Number(valStats.rows[0]?.ok || 0);
+    const accepted = Number(valStats.rows[0]?.accepted || 0);
+    const catch_all = Number(valStats.rows[0]?.catch_all || 0);
+    const rejected = Number(valStats.rows[0]?.rejected || 0);
+    const free_pool_available = Number(freePool.rows[0]?.count || 0);
+
     const validation_success_rate = total > 0 ? Math.round((ok / total) * 100) : 0;
     const personal = Number(totalPersonal.rows[0]?.count || 0);
     const corporate = Math.max(0, Number(totalMaster.rows[0]?.count || 0) - personal);
@@ -1405,10 +1431,16 @@ app.get('/admin/overview', async (_req, res) => {
     res.json({
       total_batches: Number(totalBatches.rows[0]?.count || 0),
       in_progress: Number(totalBatches.rows[0]?.count || 0), // placeholder until per-batch status is tracked
-      failed_jobs: 0, // placeholder; no error tracking table yet
+      failed_jobs: 0, // placeholder
       validation_success_rate,
       active_employees: Number(employees.rows[0]?.count || 0),
-      domains: { corporate, personal }
+      domains: { corporate, personal },
+      stats: {
+        accepted,
+        catch_all,
+        rejected,
+        free_pool_available
+      }
     });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_overview_failed', details: err.message });

@@ -3,8 +3,27 @@ import { config } from '../config';
 import Redis from 'ioredis';
 import { CHANNELS } from '../redis';
 
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://localhost:3003',
+  'http://localhost:3004',
+  'http://localhost:3005',
+];
+
 const io = new Server({
-  cors: { origin: '*' }
+  cors: {
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.indexOf(origin) !== -1 || origin.startsWith('http://localhost:')) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS'));
+      }
+    },
+    methods: ["GET", "POST"],
+    credentials: true
+  }
 });
 
 const sub = new Redis(config.redisUrl);
