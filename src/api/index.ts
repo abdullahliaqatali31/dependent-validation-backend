@@ -1142,6 +1142,116 @@ app.get('/employee/validation/download/:type', async (req, res) => {
   }
 });
 
+app.get('/employee/validation/export-all', async (req, res) => {
+  try {
+    const employeeUuid = String((req.query.employee_id || '').toString());
+    const q = (req.query.q || '').toString();
+    if (!employeeUuid) return res.status(400).send('missing_employee_id');
+    
+    let sql = `
+      SELECT vr.id, me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+             vr.outcome AS status, vr.category, me.first_seen_at AS first_found_at,
+             me.batch_id, vr.validated_at
+      FROM validation_results vr
+      JOIN master_emails me ON vr.master_id = me.id
+      JOIN batches b ON me.batch_id = b.batch_id
+      WHERE b.submitter_uuid = $1 AND vr.outcome IN ('accepted','catch_all','rejected') AND COALESCE(vr.is_downloaded,false)=false
+    `;
+    const params: any[] = [employeeUuid];
+    if (q) {
+      params.push(`%${q}%`);
+      sql += ` AND me.email_normalized ILIKE $${params.length}`;
+    }
+    sql += ` ORDER BY vr.validated_at DESC`;
+
+    const rows = await query<{
+      id: number;
+      email: string;
+      domain: string | null;
+      status: string;
+      category: string;
+      first_found_at: string | null;
+      batch_id: number;
+      validated_at: string | null;
+    }>(sql, params);
+
+    if (rows.rows.length === 0) return res.status(400).send('no_rows');
+    const ids = rows.rows.map(r => r.id);
+    const header = 'email,domain,status,category,first_found_at,batch_id,validated_at,downloaded_at\n';
+    const ts = new Date().toISOString();
+    const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.first_found_at ? new Date(r.first_found_at).toISOString() : ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''},${ts}`).join('\n');
+    const csv = header + body;
+    const dir = require('path').join(require('../config').config.downloadDir, String(employeeUuid), 'global', String(Date.now()));
+    require('fs').mkdirSync(dir, { recursive: true });
+    const file = require('path').join(dir, `all_results.csv`);
+    require('fs').writeFileSync(file, csv);
+    await query('BEGIN');
+    await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [ids, employeeUuid]);
+    await query('INSERT INTO download_history(employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4)', [employeeUuid, 'global_all', file, rows.rows.length]);
+    await query('COMMIT');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="all_results_${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err: any) {
+    try { await query('ROLLBACK'); } catch {}
+    console.error(err);
+    res.status(500).send('export_all_failed');
+  }
+});
+
+app.get('/employee/validation/export-category', async (req, res) => {
+  try {
+    const { employee_id: employeeUuid, category, outcome, q } = req.query;
+    if (!employeeUuid || !category || !outcome) return res.status(400).send('missing_params');
+    
+    let sql = `
+      SELECT vr.id, me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+             vr.outcome AS status, vr.category, me.batch_id, vr.validated_at
+      FROM validation_results vr
+      JOIN master_emails me ON vr.master_id = me.id
+      JOIN batches b ON me.batch_id = b.batch_id
+      WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false
+    `;
+    const params: any[] = [employeeUuid, String(category), String(outcome)];
+    if (q) {
+      params.push(`%${q}%`);
+      sql += ` AND me.email_normalized ILIKE $${params.length}`;
+    }
+    sql += ` ORDER BY vr.validated_at DESC`;
+
+    const rows = await query<{
+      id: number;
+      email: string;
+      domain: string | null;
+      status: string;
+      category: string;
+      batch_id: number;
+      validated_at: string | null;
+    }>(sql, params);
+
+    if (rows.rows.length === 0) return res.status(400).send('no_rows');
+    const ids = rows.rows.map(r => r.id);
+    const header = 'email,domain,status,category,batch_id,validated_at\n';
+    const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''}`).join('\n');
+    const csv = header + body;
+    const dir = require('path').join(require('../config').config.downloadDir, String(employeeUuid), 'global', String(Date.now()));
+    require('fs').mkdirSync(dir, { recursive: true });
+    const file = require('path').join(dir, `${category}_${outcome}.csv`);
+    require('fs').writeFileSync(file, csv);
+    await query('BEGIN');
+    await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [ids, employeeUuid]);
+    await query('INSERT INTO download_history(employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4)', [employeeUuid, `${category}_${outcome}`, file, rows.rows.length]);
+    await query('COMMIT');
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${category}_${outcome}_${Date.now()}.csv"`);
+    res.send(csv);
+  } catch (err: any) {
+    try { await query('ROLLBACK'); } catch {}
+    console.error(err);
+    res.status(500).send('export_category_failed');
+  }
+});
+
 app.post('/employee/validation/mark-downloaded', async (req, res) => {
   try {
     const { id: employeeUuid, role } = getSupabaseUser(req);
@@ -1410,19 +1520,41 @@ app.get('/admin/overview', async (_req, res) => {
          COUNT(*) AS total,
          COUNT(*) FILTER (WHERE status_enum = 'deliverable') AS ok,
          COUNT(*) FILTER (WHERE outcome = 'accepted') AS accepted,
+         COUNT(*) FILTER (WHERE outcome = 'accepted' AND category = 'business') AS accepted_business,
+         COUNT(*) FILTER (WHERE outcome = 'accepted' AND category = 'personal') AS accepted_personal,
          COUNT(*) FILTER (WHERE outcome = 'catch_all') AS catch_all,
-         COUNT(*) FILTER (WHERE outcome = 'rejected') AS rejected
-       FROM validation_results`
+         COUNT(*) FILTER (WHERE outcome = 'catch_all' AND category = 'business') AS catch_all_business,
+         COUNT(*) FILTER (WHERE outcome = 'catch_all' AND category = 'personal') AS catch_all_personal,
+         COUNT(*) FILTER (WHERE outcome = 'rejected') AS rejected,
+         COUNT(*) FILTER (WHERE outcome = 'rejected' AND category = 'business') AS rejected_business,
+         COUNT(*) FILTER (WHERE outcome = 'rejected' AND category = 'personal') AS rejected_personal
+       FROM validation_results vr
+       LEFT JOIN master_emails me ON vr.master_id = me.id`
     );
-    const freePool = await query('SELECT COUNT(*) FROM free_pool WHERE is_free_pool = true AND is_assigned = false');
+    const freePool = await query(
+      `SELECT 
+         COUNT(*) AS count,
+         COUNT(*) FILTER (WHERE category = 'business') AS business,
+         COUNT(*) FILTER (WHERE category = 'personal') AS personal
+       FROM free_pool 
+       WHERE is_free_pool = true AND is_assigned = false`
+    );
     const employees = await query('SELECT COUNT(DISTINCT submitter_id) FROM batches WHERE submitter_id IS NOT NULL');
 
     const total = Number(valStats.rows[0]?.total || 0);
     const ok = Number(valStats.rows[0]?.ok || 0);
     const accepted = Number(valStats.rows[0]?.accepted || 0);
+    const accepted_business = Number(valStats.rows[0]?.accepted_business || 0);
+    const accepted_personal = Number(valStats.rows[0]?.accepted_personal || 0);
     const catch_all = Number(valStats.rows[0]?.catch_all || 0);
+    const catch_all_business = Number(valStats.rows[0]?.catch_all_business || 0);
+    const catch_all_personal = Number(valStats.rows[0]?.catch_all_personal || 0);
     const rejected = Number(valStats.rows[0]?.rejected || 0);
+    const rejected_business = Number(valStats.rows[0]?.rejected_business || 0);
+    const rejected_personal = Number(valStats.rows[0]?.rejected_personal || 0);
     const free_pool_available = Number(freePool.rows[0]?.count || 0);
+    const free_pool_business = Number(freePool.rows[0]?.business || 0);
+    const free_pool_personal = Number(freePool.rows[0]?.personal || 0);
 
     const validation_success_rate = total > 0 ? Math.round((ok / total) * 100) : 0;
     const personal = Number(totalPersonal.rows[0]?.count || 0);
@@ -1437,9 +1569,17 @@ app.get('/admin/overview', async (_req, res) => {
       domains: { corporate, personal },
       stats: {
         accepted,
+        accepted_business,
+        accepted_personal,
         catch_all,
+        catch_all_business,
+        catch_all_personal,
         rejected,
-        free_pool_available
+        rejected_business,
+        rejected_personal,
+        free_pool_available,
+        free_pool_business,
+        free_pool_personal
       }
     });
   } catch (err: any) {
