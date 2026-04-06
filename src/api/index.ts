@@ -1187,7 +1187,7 @@ app.get('/employee/validation/export-all', async (req, res) => {
     require('fs').writeFileSync(file, csv);
     await query('BEGIN');
     await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [ids, employeeUuid]);
-    await query('INSERT INTO download_history(employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4)', [employeeUuid, 'global_all', file, rows.rows.length]);
+    await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, 'global_all', file, rows.rows.length]);
     await query('COMMIT');
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="all_results_${Date.now()}.csv"`);
@@ -1240,7 +1240,7 @@ app.get('/employee/validation/export-category', async (req, res) => {
     require('fs').writeFileSync(file, csv);
     await query('BEGIN');
     await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [ids, employeeUuid]);
-    await query('INSERT INTO download_history(employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4)', [employeeUuid, `${category}_${outcome}`, file, rows.rows.length]);
+    await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, `${category}_${outcome}`, file, rows.rows.length]);
     await query('COMMIT');
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="${category}_${outcome}_${Date.now()}.csv"`);
