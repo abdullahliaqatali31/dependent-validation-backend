@@ -1674,6 +1674,31 @@ app.put('/admin/users/:id/role', async (req, res) => {
   }
 });
 
+// Admin: delete user (Auth + Profiles)
+app.delete('/admin/users/:id', async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const id = String(req.params.id || '');
+    if (!id) return res.status(400).json({ error: 'missing_user_id' });
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'supabase_admin_not_configured' });
+    }
+    // Delete from Supabase Auth (DB profiles table has ON DELETE CASCADE on auth.users)
+    const { error: dErr } = await supabaseAdmin.auth.admin.deleteUser(id);
+    if (dErr) throw dErr;
+
+    // Log the deletion
+    const { id: actorUuid } = getSupabaseUser(req);
+    await query('INSERT INTO audit_logs(action_type, actor_id, resource_ref, details) VALUES ($1, $2, $3, $4)', 
+      ['admin_user_delete', null, `user:${id}`, JSON.stringify({ deleted_by: actorUuid })]);
+
+    res.json({ ok: true, message: 'User deleted successfully' });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: 'admin_user_delete_failed', details: err.message });
+  }
+});
+
 // Admin: control actions (stub)
 app.post('/admin/control/:action', async (req, res) => {
   try {
