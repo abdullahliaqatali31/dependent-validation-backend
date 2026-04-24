@@ -372,7 +372,7 @@ app.get('/employee/results/by-category', async (req, res) => {
           
           SELECT email, NULL as reason, NULL as key, assigned_at as ts
           FROM free_pool
-          WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true
+          WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true AND COALESCE(is_downloaded,false)=false
         ) as combined
         ORDER BY ts DESC LIMIT 2000
       `;
@@ -1149,20 +1149,29 @@ app.get('/employee/validation/export-all', async (req, res) => {
     if (!employeeUuid) return res.status(400).send('missing_employee_id');
     
     let sql = `
-      SELECT vr.id, me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
-             vr.outcome AS status, vr.category, me.first_seen_at AS first_found_at,
-             me.batch_id, vr.validated_at
-      FROM validation_results vr
-      JOIN master_emails me ON vr.master_id = me.id
-      JOIN batches b ON me.batch_id = b.batch_id
-      WHERE b.submitter_uuid = $1 AND vr.outcome IN ('accepted','catch_all','rejected') AND COALESCE(vr.is_downloaded,false)=false
+      SELECT email, domain, status, category, first_found_at, batch_id, validated_at, source, id FROM (
+        SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+               vr.outcome AS status, vr.category, me.first_seen_at AS first_found_at,
+               me.batch_id, vr.validated_at, 'validation' as source, vr.id
+        FROM validation_results vr
+        JOIN master_emails me ON vr.master_id = me.id
+        JOIN batches b ON me.batch_id = b.batch_id
+        WHERE b.submitter_uuid = $1 AND vr.outcome IN ('accepted','catch_all','rejected') AND COALESCE(vr.is_downloaded,false)=false
+        
+        UNION ALL
+        
+        SELECT email, domain, outcome AS status, category, created_at AS first_found_at,
+               batch_id, assigned_at AS validated_at, 'free_pool' as source, id
+        FROM free_pool
+        WHERE assigned_to_uuid = $1 AND outcome IN ('accepted','catch_all','rejected') AND is_assigned = true AND COALESCE(is_downloaded,false)=false
+      ) as combined
     `;
     const params: any[] = [employeeUuid];
     if (q) {
       params.push(`%${q}%`);
-      sql += ` AND me.email_normalized ILIKE $${params.length}`;
+      sql += ` WHERE email ILIKE $${params.length}`;
     }
-    sql += ` ORDER BY vr.validated_at DESC`;
+    sql += ` ORDER BY validated_at DESC`;
 
     const rows = await query<{
       id: number;
@@ -1173,10 +1182,13 @@ app.get('/employee/validation/export-all', async (req, res) => {
       first_found_at: string | null;
       batch_id: number;
       validated_at: string | null;
+      source: 'validation' | 'free_pool';
     }>(sql, params);
 
     if (rows.rows.length === 0) return res.status(400).send('no_rows');
-    const ids = rows.rows.map(r => r.id);
+    const vIds = rows.rows.filter(r => r.source === 'validation').map(r => r.id);
+    const fpIds = rows.rows.filter(r => r.source === 'free_pool').map(r => r.id);
+    
     const header = 'email,domain,status,category,first_found_at,batch_id,validated_at,downloaded_at\n';
     const ts = new Date().toISOString();
     const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.first_found_at ? new Date(r.first_found_at).toISOString() : ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''},${ts}`).join('\n');
@@ -1186,7 +1198,12 @@ app.get('/employee/validation/export-all', async (req, res) => {
     const file = require('path').join(dir, `all_results.csv`);
     require('fs').writeFileSync(file, csv);
     await query('BEGIN');
-    await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [ids, employeeUuid]);
+    if (vIds.length > 0) {
+      await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [vIds, employeeUuid]);
+    }
+    if (fpIds.length > 0) {
+      await query('UPDATE free_pool SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [fpIds, employeeUuid]);
+    }
     await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, 'global_all', file, rows.rows.length]);
     await query('COMMIT');
     res.setHeader('Content-Type', 'text/csv');
@@ -1205,19 +1222,27 @@ app.get('/employee/validation/export-category', async (req, res) => {
     if (!employeeUuid || !category || !outcome) return res.status(400).send('missing_params');
     
     let sql = `
-      SELECT vr.id, me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
-             vr.outcome AS status, vr.category, me.batch_id, vr.validated_at
-      FROM validation_results vr
-      JOIN master_emails me ON vr.master_id = me.id
-      JOIN batches b ON me.batch_id = b.batch_id
-      WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false
+      SELECT email, domain, status, category, batch_id, validated_at, source, id FROM (
+        SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+               vr.outcome AS status, vr.category, me.batch_id, vr.validated_at, 'validation' as source, vr.id
+        FROM validation_results vr
+        JOIN master_emails me ON vr.master_id = me.id
+        JOIN batches b ON me.batch_id = b.batch_id
+        WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false
+        
+        UNION ALL
+        
+        SELECT email, domain, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' as source, id
+        FROM free_pool
+        WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false
+      ) as combined
     `;
     const params: any[] = [employeeUuid, String(category), String(outcome)];
     if (q) {
       params.push(`%${q}%`);
-      sql += ` AND me.email_normalized ILIKE $${params.length}`;
+      sql += ` WHERE email ILIKE $${params.length}`;
     }
-    sql += ` ORDER BY vr.validated_at DESC`;
+    sql += ` ORDER BY validated_at DESC`;
 
     const rows = await query<{
       id: number;
@@ -1227,10 +1252,14 @@ app.get('/employee/validation/export-category', async (req, res) => {
       category: string;
       batch_id: number;
       validated_at: string | null;
+      source: 'validation' | 'free_pool';
     }>(sql, params);
 
     if (rows.rows.length === 0) return res.status(400).send('no_rows');
-    const ids = rows.rows.map(r => r.id);
+
+    const vIds = rows.rows.filter(r => r.source === 'validation').map(r => r.id);
+    const fpIds = rows.rows.filter(r => r.source === 'free_pool').map(r => r.id);
+
     const header = 'email,domain,status,category,batch_id,validated_at\n';
     const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''}`).join('\n');
     const csv = header + body;
@@ -1239,7 +1268,12 @@ app.get('/employee/validation/export-category', async (req, res) => {
     const file = require('path').join(dir, `${category}_${outcome}.csv`);
     require('fs').writeFileSync(file, csv);
     await query('BEGIN');
-    await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [ids, employeeUuid]);
+    if (vIds.length > 0) {
+      await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [vIds, employeeUuid]);
+    }
+    if (fpIds.length > 0) {
+      await query('UPDATE free_pool SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [fpIds, employeeUuid]);
+    }
     await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, `${category}_${outcome}`, file, rows.rows.length]);
     await query('COMMIT');
     res.setHeader('Content-Type', 'text/csv');
