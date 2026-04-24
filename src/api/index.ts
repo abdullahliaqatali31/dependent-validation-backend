@@ -871,7 +871,7 @@ app.get('/employee/validation-summary', async (req, res) => {
     const fpRows = await query(
       `SELECT category, outcome, COUNT(*) AS c
        FROM free_pool
-       WHERE assigned_to_uuid = $1 AND is_assigned = true
+       WHERE assigned_to_uuid = $1 AND is_assigned = true AND COALESCE(is_downloaded, false)=false
        GROUP BY category, outcome`,
       [employeeId]
     );
