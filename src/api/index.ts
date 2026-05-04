@@ -2008,12 +2008,11 @@ app.post('/free-pool/assign', async (req, res) => {
 
     async function take(category: string, outcome: string, n: number) {
       if (n <= 0) return [] as any[];
-      // Use DISTINCT ON (email) to ensure we don't pick the same email multiple times if duplicates somehow persist
       const q = await query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-        `SELECT DISTINCT ON (email) id, email, domain, category, outcome 
+        `SELECT id, email, domain, category, outcome 
          FROM free_pool 
          WHERE is_assigned=false AND category=$1 AND outcome=$2 
-         ORDER BY email, id ASC 
+         ORDER BY id ASC 
          LIMIT $3`,
         [category, outcome, n]
       );
@@ -2031,33 +2030,39 @@ app.post('/free-pool/assign', async (req, res) => {
       }
       rows = [...bizAcc, ...bizCat, ...perAcc, ...perCat];
     } else {
-      // Fallback only if no specific requested categories or if allowed
+      // Fallback: prefer ONLY 'accepted' unless not enough exist. 
+      // If the user wants catch-all, they should specify it in the 'request' object.
       const anyQ = await query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-        `SELECT DISTINCT ON (email) id, email, domain, category, outcome
+        `SELECT id, email, domain, category, outcome
          FROM free_pool
-         WHERE is_assigned=false AND outcome IN ('accepted','catch_all')
-         ORDER BY email, id ASC
+         WHERE is_assigned=false AND outcome = 'accepted'
+         ORDER BY id ASC
          LIMIT $1`,
         [limit]
       );
       rows = anyQ.rows;
-      if (rows.length === 0) {
-        return res.status(404).json({ error: 'no_available_emails_in_free_pool' });
-      }
-      if (rows.length < limit) return res.status(400).json({ error: 'not_enough_free_pool', available: rows.length, required: limit });
+
+      // If we don't have enough 'accepted', we don't pull catch_all automatically 
+      // to keep data "clean" as requested by the user.
     }
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'no_available_accepted_emails_in_free_pool' });
+    }
+    if (rows.length < limit) return res.status(400).json({ error: 'not_enough_free_pool', available: rows.length, required: limit });
 
     const ids = rows.map(r => r.id);
     await query('BEGIN');
     await query('UPDATE free_pool SET is_assigned=true, assigned_to_uuid=$2, assigned_at=now() WHERE id = ANY($1::bigint[])', [ids, employeeId]);
     for (const r of rows) {
-      const email = String(r.email || '');
+      // Trim email to prevent %20 issues in UI
+      const email = String(r.email || '').trim();
       const domain = r.domain || null;
       const outcome = ['accepted','catch_all','rejected','timeout'].includes(String(r.outcome || '')) ? String(r.outcome) : 'accepted';
       if (String(r.category || '') === 'personal') {
-        await query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool) VALUES (NULL, NULL, $1, $2, $3, true)', [email, domain, outcome]);
+        await query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
       } else {
-        await query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool) VALUES (NULL, NULL, $1, $2, $3, true)', [email, domain, outcome]);
+        await query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
       }
     }
     await query('INSERT INTO free_pool_assignments(employee_uuid, business_accepted, business_catch_all, personal_accepted, personal_catch_all, total) VALUES ($1, $2, $3, $4, $5, $6)', [employeeId, rBizAcc, rBizCat, rPerAcc, rPerCat, limit]);
