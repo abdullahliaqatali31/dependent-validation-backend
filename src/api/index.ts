@@ -2008,8 +2008,13 @@ app.post('/free-pool/assign', async (req, res) => {
 
     async function take(category: string, outcome: string, n: number) {
       if (n <= 0) return [] as any[];
+      // Use DISTINCT ON (email) to ensure we don't pick the same email multiple times if duplicates somehow persist
       const q = await query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-        `SELECT id, email, domain, category, outcome FROM free_pool WHERE is_assigned=false AND category=$1 AND outcome=$2 ORDER BY id LIMIT $3`,
+        `SELECT DISTINCT ON (email) id, email, domain, category, outcome 
+         FROM free_pool 
+         WHERE is_assigned=false AND category=$1 AND outcome=$2 
+         ORDER BY email, id ASC 
+         LIMIT $3`,
         [category, outcome, n]
       );
       return q.rows;
@@ -2026,15 +2031,19 @@ app.post('/free-pool/assign', async (req, res) => {
       }
       rows = [...bizAcc, ...bizCat, ...perAcc, ...perCat];
     } else {
+      // Fallback only if no specific requested categories or if allowed
       const anyQ = await query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-        `SELECT id, email, domain, category, outcome
+        `SELECT DISTINCT ON (email) id, email, domain, category, outcome
          FROM free_pool
          WHERE is_assigned=false AND outcome IN ('accepted','catch_all')
-         ORDER BY id
+         ORDER BY email, id ASC
          LIMIT $1`,
         [limit]
       );
       rows = anyQ.rows;
+      if (rows.length === 0) {
+        return res.status(404).json({ error: 'no_available_emails_in_free_pool' });
+      }
       if (rows.length < limit) return res.status(400).json({ error: 'not_enough_free_pool', available: rows.length, required: limit });
     }
 

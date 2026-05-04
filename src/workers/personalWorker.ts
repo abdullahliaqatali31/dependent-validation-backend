@@ -45,7 +45,7 @@ async function processMaster(masterId: number) {
   }
   if (isCollector) {
     await query(
-      'INSERT INTO free_pool(email, domain, category, outcome, metadata, is_assigned, is_free_pool, batch_id) VALUES ($1, $2, $3, $4, $5, false, true, $6)',
+      'INSERT INTO free_pool(email, domain, category, outcome, metadata, is_assigned, is_free_pool, batch_id) VALUES ($1, $2, $3, $4, $5, false, true, $6) ON CONFLICT (email) DO NOTHING',
       [email, domain, category, outcome, JSON.stringify({ master_id: masterId }), batch_id]
     );
   }
