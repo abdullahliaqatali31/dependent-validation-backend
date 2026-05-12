@@ -346,7 +346,7 @@ app.get('/employee/results/by-category', async (req, res) => {
     if (!batchId && !employeeId) return res.status(400).json({ error: 'missing_scope' });
 
     let sql = '';
-    const params: any[] = [category, outcome];
+    let params: any[] = [category, outcome];
 
     if (batchId) {
       sql = `SELECT me.email_normalized AS email,
@@ -358,14 +358,19 @@ app.get('/employee/results/by-category', async (req, res) => {
              ORDER BY vr.validated_at DESC LIMIT 2000`;
       params.push(Number(batchId));
     } else if (source === 'own') {
-      sql = `SELECT me.email_normalized AS email,
+      // Use final tables with is_free_pool=false — guarantees no overlap with free pool section
+      const table = category === 'personal' ? 'final_personal_emails' : 'final_business_emails';
+      sql = `SELECT f.email,
                     COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason,
                     vr.ninja_key_used AS key
-             FROM validation_results vr
-             JOIN master_emails me ON vr.master_id=me.id
-             WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.submitter_uuid=$3
-             ORDER BY vr.validated_at DESC LIMIT 2000`;
-      params.push(employeeId);
+             FROM ${table} f
+             JOIN batches b ON f.batch_id = b.batch_id
+             LEFT JOIN validation_results vr ON vr.master_id = f.master_id AND COALESCE(vr.is_downloaded, false) = false
+             WHERE b.submitter_uuid = $1
+               AND f.outcome = $2
+               AND COALESCE(f.is_free_pool, false) = false
+             ORDER BY f.id DESC LIMIT 2000`;
+      params = [employeeId, outcome];
     } else if (source === 'free_pool') {
       sql = `SELECT email, NULL AS reason, NULL AS key
              FROM free_pool
@@ -885,14 +890,25 @@ app.get('/employee/validation-summary', async (req, res) => {
     };
 
     const [ownRows, fpRows] = await Promise.all([
+      // Own: use final tables with is_free_pool=false to guarantee no overlap with free pool data
       query(
-        `SELECT vr.category, vr.outcome, COUNT(*) AS c
-         FROM validation_results vr
-         JOIN master_emails me ON vr.master_id = me.id
-         WHERE me.submitter_uuid = $1 AND COALESCE(vr.is_downloaded,false)=false
-         GROUP BY vr.category, vr.outcome`,
+        `SELECT category, outcome, COUNT(*) AS c FROM (
+           SELECT 'business' AS category, fbe.outcome
+           FROM final_business_emails fbe
+           JOIN batches b ON fbe.batch_id = b.batch_id
+           WHERE b.submitter_uuid = $1 AND COALESCE(fbe.is_free_pool, false) = false
+
+           UNION ALL
+
+           SELECT 'personal' AS category, fpe.outcome
+           FROM final_personal_emails fpe
+           JOIN batches b ON fpe.batch_id = b.batch_id
+           WHERE b.submitter_uuid = $1 AND COALESCE(fpe.is_free_pool, false) = false
+         ) t
+         GROUP BY category, outcome`,
         [employeeId]
       ),
+      // Free pool: emails assigned to this employee from the shared pool
       query(
         `SELECT category, outcome, COUNT(*) AS c
          FROM free_pool
@@ -1166,16 +1182,25 @@ app.get('/employee/validation/export-all', async (req, res) => {
     if (!employeeUuid) return res.status(400).send('missing_employee_id');
 
     let sql = '';
-    const params: any[] = [employeeUuid];
+    let params: any[] = [employeeUuid];
 
     if (source === 'own') {
-      sql = `SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
-                    vr.outcome AS status, vr.category, me.first_seen_at AS first_found_at,
-                    me.batch_id, vr.validated_at, 'validation' AS source, vr.id
-             FROM validation_results vr
-             JOIN master_emails me ON vr.master_id = me.id
-             JOIN batches b ON me.batch_id = b.batch_id
-             WHERE b.submitter_uuid = $1 AND vr.outcome IN ('accepted','catch_all','rejected') AND COALESCE(vr.is_downloaded,false)=false`;
+      sql = `SELECT f.email, f.domain,
+                    f.outcome AS status, f.category,
+                    b.created_at AS first_found_at,
+                    f.batch_id, vr.validated_at, 'validation' AS source, vr.id
+             FROM (
+               SELECT batch_id, master_id, email, domain, outcome, 'business' AS category, is_free_pool
+               FROM final_business_emails
+               WHERE outcome IN ('accepted','catch_all','rejected') AND COALESCE(is_free_pool, false) = false
+               UNION ALL
+               SELECT batch_id, master_id, email, domain, outcome, 'personal' AS category, is_free_pool
+               FROM final_personal_emails
+               WHERE outcome IN ('accepted','catch_all','rejected') AND COALESCE(is_free_pool, false) = false
+             ) f
+             JOIN batches b ON f.batch_id = b.batch_id
+             LEFT JOIN validation_results vr ON vr.master_id = f.master_id
+             WHERE b.submitter_uuid = $1`;
     } else if (source === 'free_pool') {
       sql = `SELECT email, domain, outcome AS status, category, created_at AS first_found_at,
                     batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
@@ -1220,9 +1245,9 @@ app.get('/employee/validation/export-all', async (req, res) => {
     }>(sql, params);
 
     if (rows.rows.length === 0) return res.status(400).send('no_rows');
-    const vIds = rows.rows.filter(r => r.source === 'validation').map(r => r.id);
-    const fpIds = rows.rows.filter(r => r.source === 'free_pool').map(r => r.id);
-    
+    const vIds = rows.rows.filter(r => r.source === 'validation' && r.id != null).map(r => r.id);
+    const fpIds = rows.rows.filter(r => r.source === 'free_pool' && r.id != null).map(r => r.id);
+
     const header = 'email,domain,status,category,first_found_at,batch_id,validated_at,downloaded_at\n';
     const ts = new Date().toISOString();
     const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.first_found_at ? new Date(r.first_found_at).toISOString() : ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''},${ts}`).join('\n');
@@ -1257,15 +1282,20 @@ app.get('/employee/validation/export-category', async (req, res) => {
     const source = String(sourceRaw || '').toLowerCase(); // 'own' | 'free_pool' | ''
 
     let sql = '';
-    const params: any[] = [employeeUuid, String(category), String(outcome)];
+    let params: any[] = [employeeUuid, String(category), String(outcome)];
 
     if (source === 'own') {
-      sql = `SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
-                    vr.outcome AS status, vr.category, me.batch_id, vr.validated_at, 'validation' AS source, vr.id
-             FROM validation_results vr
-             JOIN master_emails me ON vr.master_id = me.id
-             JOIN batches b ON me.batch_id = b.batch_id
-             WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false`;
+      const cat = String(category);
+      if (cat !== 'personal' && cat !== 'business') return res.status(400).send('invalid_category');
+      const table = cat === 'personal' ? 'final_personal_emails' : 'final_business_emails';
+      sql = `SELECT f.email, f.domain,
+                    f.outcome AS status, '${cat}' AS category,
+                    f.batch_id, vr.validated_at, 'validation' AS source, vr.id
+             FROM ${table} f
+             JOIN batches b ON f.batch_id = b.batch_id
+             LEFT JOIN validation_results vr ON vr.master_id = f.master_id
+             WHERE b.submitter_uuid = $1 AND f.outcome = $2 AND COALESCE(f.is_free_pool, false) = false`;
+      params = [employeeUuid, String(outcome)];
     } else if (source === 'free_pool') {
       sql = `SELECT email, domain, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
              FROM free_pool
@@ -1307,8 +1337,8 @@ app.get('/employee/validation/export-category', async (req, res) => {
 
     if (rows.rows.length === 0) return res.status(400).send('no_rows');
 
-    const vIds = rows.rows.filter(r => r.source === 'validation').map(r => r.id);
-    const fpIds = rows.rows.filter(r => r.source === 'free_pool').map(r => r.id);
+    const vIds = rows.rows.filter(r => r.source === 'validation' && r.id != null).map(r => r.id);
+    const fpIds = rows.rows.filter(r => r.source === 'free_pool' && r.id != null).map(r => r.id);
 
     const header = 'email,domain,status,category,batch_id,validated_at\n';
     const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''}`).join('\n');
