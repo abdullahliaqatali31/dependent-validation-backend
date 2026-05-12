@@ -341,9 +341,10 @@ app.get('/employee/results/by-category', async (req, res) => {
     const outcome = String((req.query.outcome || '').toString()).toLowerCase();
     const batchId = (req.query.batch_id || '').toString();
     const employeeId = (req.query.employee_id || '').toString();
+    const source = String((req.query.source || '').toString()).toLowerCase(); // 'own' | 'free_pool' | '' (both)
     if (!['business','personal'].includes(category) || !['accepted','catch_all','rejected','timeout'].includes(outcome)) return res.status(400).json({ error: 'invalid_params' });
     if (!batchId && !employeeId) return res.status(400).json({ error: 'missing_scope' });
-    
+
     let sql = '';
     const params: any[] = [category, outcome];
 
@@ -356,29 +357,44 @@ app.get('/employee/results/by-category', async (req, res) => {
              WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.batch_id=$3
              ORDER BY vr.validated_at DESC LIMIT 2000`;
       params.push(Number(batchId));
+    } else if (source === 'own') {
+      sql = `SELECT me.email_normalized AS email,
+                    COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason,
+                    vr.ninja_key_used AS key
+             FROM validation_results vr
+             JOIN master_emails me ON vr.master_id=me.id
+             WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.submitter_uuid=$3
+             ORDER BY vr.validated_at DESC LIMIT 2000`;
+      params.push(employeeId);
+    } else if (source === 'free_pool') {
+      sql = `SELECT email, NULL AS reason, NULL AS key
+             FROM free_pool
+             WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true AND COALESCE(is_downloaded,false)=false
+             ORDER BY assigned_at DESC LIMIT 2000`;
+      params.push(employeeId);
     } else {
-      // Employee view: include free pool
+      // Legacy: no source filter — return both merged (backwards compat)
       sql = `
         SELECT email, reason, key FROM (
           SELECT me.email_normalized AS email,
                  COALESCE(vr.details->>'reason', vr.details->>'error', vr.message) AS reason,
                  vr.ninja_key_used AS key,
-                 vr.validated_at as ts
+                 vr.validated_at AS ts
           FROM validation_results vr
           JOIN master_emails me ON vr.master_id=me.id
           WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.submitter_uuid=$3
-          
+
           UNION ALL
-          
-          SELECT email, NULL as reason, NULL as key, assigned_at as ts
+
+          SELECT email, NULL AS reason, NULL AS key, assigned_at AS ts
           FROM free_pool
           WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true AND COALESCE(is_downloaded,false)=false
-        ) as combined
+        ) AS combined
         ORDER BY ts DESC LIMIT 2000
       `;
       params.push(employeeId);
     }
-    
+
     const rows = await query<{ email: string; reason: string | null; key: string | null }>(sql, params);
     res.json(rows.rows);
   } catch (err: any) {
@@ -856,42 +872,42 @@ app.get('/employee/validation-summary', async (req, res) => {
   try {
     const employeeId = String((req.query.employee_id || '').toString());
     if (!employeeId) return res.status(400).json({ error: 'missing_employee_id' });
-    
-    // Regular validation results
-    const rows = await query(
-      `SELECT vr.category, vr.outcome, COUNT(*) AS c
-       FROM validation_results vr
-       JOIN master_emails me ON vr.master_id = me.id
-       WHERE me.submitter_uuid = $1 AND COALESCE(vr.is_downloaded,false)=false
-       GROUP BY vr.category, vr.outcome`,
-      [employeeId]
-    );
 
-    // Free pool assignments
-    const fpRows = await query(
-      `SELECT category, outcome, COUNT(*) AS c
-       FROM free_pool
-       WHERE assigned_to_uuid = $1 AND is_assigned = true AND COALESCE(is_downloaded, false)=false
-       GROUP BY category, outcome`,
-      [employeeId]
-    );
-
-    const result: any = { business: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0 }, personal: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0 } };
-    
-    const merge = (list: any[]) => {
+    const emptyTotals = () => ({ business: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0 }, personal: { accepted: 0, catch_all: 0, rejected: 0, timeout: 0 } });
+    const fill = (target: any, list: any[]) => {
       for (const r of list) {
         const cat = String(r.category || '').toLowerCase();
         const out = String(r.outcome || '').toLowerCase();
         const count = Number(r.c || 0);
-        if (cat === 'business' && result.business[out] !== undefined) result.business[out] += count;
-        if (cat === 'personal' && result.personal[out] !== undefined) result.personal[out] += count;
+        if (cat === 'business' && target.business[out] !== undefined) target.business[out] += count;
+        if (cat === 'personal' && target.personal[out] !== undefined) target.personal[out] += count;
       }
     };
 
-    merge(rows.rows);
-    merge(fpRows.rows);
+    const [ownRows, fpRows] = await Promise.all([
+      query(
+        `SELECT vr.category, vr.outcome, COUNT(*) AS c
+         FROM validation_results vr
+         JOIN master_emails me ON vr.master_id = me.id
+         WHERE me.submitter_uuid = $1 AND COALESCE(vr.is_downloaded,false)=false
+         GROUP BY vr.category, vr.outcome`,
+        [employeeId]
+      ),
+      query(
+        `SELECT category, outcome, COUNT(*) AS c
+         FROM free_pool
+         WHERE assigned_to_uuid = $1 AND is_assigned = true AND COALESCE(is_downloaded, false)=false
+         GROUP BY category, outcome`,
+        [employeeId]
+      ),
+    ]);
 
-    res.json(result);
+    const own = emptyTotals();
+    const free_pool = emptyTotals();
+    fill(own, ownRows.rows);
+    fill(free_pool, fpRows.rows);
+
+    res.json({ own, free_pool });
   } catch (err: any) {
     res.status(500).json({ error: 'employee_validation_summary_failed', details: err.message });
   }
@@ -1146,30 +1162,48 @@ app.get('/employee/validation/export-all', async (req, res) => {
   try {
     const employeeUuid = String((req.query.employee_id || '').toString());
     const q = (req.query.q || '').toString();
+    const source = String((req.query.source || '').toString()).toLowerCase(); // 'own' | 'free_pool' | ''
     if (!employeeUuid) return res.status(400).send('missing_employee_id');
-    
-    let sql = `
-      SELECT email, domain, status, category, first_found_at, batch_id, validated_at, source, id FROM (
-        SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
-               vr.outcome AS status, vr.category, me.first_seen_at AS first_found_at,
-               me.batch_id, vr.validated_at, 'validation' as source, vr.id
-        FROM validation_results vr
-        JOIN master_emails me ON vr.master_id = me.id
-        JOIN batches b ON me.batch_id = b.batch_id
-        WHERE b.submitter_uuid = $1 AND vr.outcome IN ('accepted','catch_all','rejected') AND COALESCE(vr.is_downloaded,false)=false
-        
-        UNION ALL
-        
-        SELECT email, domain, outcome AS status, category, created_at AS first_found_at,
-               batch_id, assigned_at AS validated_at, 'free_pool' as source, id
-        FROM free_pool
-        WHERE assigned_to_uuid = $1 AND outcome IN ('accepted','catch_all','rejected') AND is_assigned = true AND COALESCE(is_downloaded,false)=false
-      ) as combined
-    `;
+
+    let sql = '';
     const params: any[] = [employeeUuid];
+
+    if (source === 'own') {
+      sql = `SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+                    vr.outcome AS status, vr.category, me.first_seen_at AS first_found_at,
+                    me.batch_id, vr.validated_at, 'validation' AS source, vr.id
+             FROM validation_results vr
+             JOIN master_emails me ON vr.master_id = me.id
+             JOIN batches b ON me.batch_id = b.batch_id
+             WHERE b.submitter_uuid = $1 AND vr.outcome IN ('accepted','catch_all','rejected') AND COALESCE(vr.is_downloaded,false)=false`;
+    } else if (source === 'free_pool') {
+      sql = `SELECT email, domain, outcome AS status, category, created_at AS first_found_at,
+                    batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
+             FROM free_pool
+             WHERE assigned_to_uuid = $1 AND outcome IN ('accepted','catch_all','rejected') AND is_assigned = true AND COALESCE(is_downloaded,false)=false`;
+    } else {
+      sql = `
+        SELECT email, domain, status, category, first_found_at, batch_id, validated_at, source, id FROM (
+          SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+                 vr.outcome AS status, vr.category, me.first_seen_at AS first_found_at,
+                 me.batch_id, vr.validated_at, 'validation' AS source, vr.id
+          FROM validation_results vr
+          JOIN master_emails me ON vr.master_id = me.id
+          JOIN batches b ON me.batch_id = b.batch_id
+          WHERE b.submitter_uuid = $1 AND vr.outcome IN ('accepted','catch_all','rejected') AND COALESCE(vr.is_downloaded,false)=false
+
+          UNION ALL
+
+          SELECT email, domain, outcome AS status, category, created_at AS first_found_at,
+                 batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
+          FROM free_pool
+          WHERE assigned_to_uuid = $1 AND outcome IN ('accepted','catch_all','rejected') AND is_assigned = true AND COALESCE(is_downloaded,false)=false
+        ) AS combined
+      `;
+    }
     if (q) {
       params.push(`%${q}%`);
-      sql += ` WHERE email ILIKE $${params.length}`;
+      sql += ` ${source ? 'AND' : 'WHERE'} email ILIKE $${params.length}`;
     }
     sql += ` ORDER BY validated_at DESC`;
 
@@ -1218,29 +1252,45 @@ app.get('/employee/validation/export-all', async (req, res) => {
 
 app.get('/employee/validation/export-category', async (req, res) => {
   try {
-    const { employee_id: employeeUuid, category, outcome, q } = req.query;
+    const { employee_id: employeeUuid, category, outcome, q, source: sourceRaw } = req.query;
     if (!employeeUuid || !category || !outcome) return res.status(400).send('missing_params');
-    
-    let sql = `
-      SELECT email, domain, status, category, batch_id, validated_at, source, id FROM (
-        SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
-               vr.outcome AS status, vr.category, me.batch_id, vr.validated_at, 'validation' as source, vr.id
-        FROM validation_results vr
-        JOIN master_emails me ON vr.master_id = me.id
-        JOIN batches b ON me.batch_id = b.batch_id
-        WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false
-        
-        UNION ALL
-        
-        SELECT email, domain, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' as source, id
-        FROM free_pool
-        WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false
-      ) as combined
-    `;
+    const source = String(sourceRaw || '').toLowerCase(); // 'own' | 'free_pool' | ''
+
+    let sql = '';
     const params: any[] = [employeeUuid, String(category), String(outcome)];
+
+    if (source === 'own') {
+      sql = `SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+                    vr.outcome AS status, vr.category, me.batch_id, vr.validated_at, 'validation' AS source, vr.id
+             FROM validation_results vr
+             JOIN master_emails me ON vr.master_id = me.id
+             JOIN batches b ON me.batch_id = b.batch_id
+             WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false`;
+    } else if (source === 'free_pool') {
+      sql = `SELECT email, domain, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
+             FROM free_pool
+             WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false`;
+    } else {
+      sql = `
+        SELECT email, domain, status, category, batch_id, validated_at, source, id FROM (
+          SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+                 vr.outcome AS status, vr.category, me.batch_id, vr.validated_at, 'validation' AS source, vr.id
+          FROM validation_results vr
+          JOIN master_emails me ON vr.master_id = me.id
+          JOIN batches b ON me.batch_id = b.batch_id
+          WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false
+
+          UNION ALL
+
+          SELECT email, domain, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
+          FROM free_pool
+          WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false
+        ) AS combined
+      `;
+    }
     if (q) {
       params.push(`%${q}%`);
-      sql += ` WHERE email ILIKE $${params.length}`;
+      sql += ` ${source ? 'AND' : 'WHERE'} email ILIKE $${params.length}`;
     }
     sql += ` ORDER BY validated_at DESC`;
 
