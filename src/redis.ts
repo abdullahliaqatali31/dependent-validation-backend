@@ -20,12 +20,13 @@ redis.on('ready', () => {
   try { console.log('redis_ready', { url: config.redisUrl }); } catch {}
 });
 
- export async function bloomExists(key: string, item: string): Promise<boolean> {
+export async function bloomExists(key: string, item: string): Promise<boolean> {
   try {
     const res = await redis.call('BF.EXISTS', key, item) as number;
     return res === 1;
   } catch {
-    return false;
+    // Fail-closed: treat as existing (duplicate) so a Redis outage doesn't flood the DB
+    return true;
   }
 }
 

@@ -6,7 +6,7 @@ export type CleanerRules = {
 };
 
 const EMAIL_REGEX = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
-const VALID_TLDS = ['.com', '.net', '.org', '.biz', '.us', '.ca'];
+const VALID_TLDS = ['.com', '.net', '.org', '.biz', '.us', '.ca', '.io', '.co', '.uk', '.de', '.ai', '.app', '.dev', '.info', '.me', '.au', '.fr', '.nl', '.eu', '.in'];
 const REPAIR_SUFFIX_MAP: Record<string, string> = {
   '.c': '.com',
   '.co': '.com',
@@ -26,6 +26,8 @@ function stripGarbage(raw: string): string {
   s = s.replace(/\"|\'|<|>/g, '');
   s = s.replace(/mailto\s*:?/gi, '');
   s = s.replace(/u003/gi, '');
+  // Decode URL-encoded sequences (%20 → space, %40 → @, etc.)
+  try { s = decodeURIComponent(s); } catch { /* malformed encoding — leave as-is */ }
   s = s.replace(/\s+/g, ' ');
   s = s.trim();
   return s;
@@ -39,6 +41,7 @@ function applyRepairs(domain: string): { domain: string; reasons: string[] } {
       const good = REPAIR_SUFFIX_MAP[bad];
       d = d.slice(0, -bad.length) + good;
       reasons.push(`repaired:${bad}->${good}`);
+      break; // only apply one suffix repair — multiple repairs compound incorrectly
     }
   }
   for (const tld of VALID_TLDS) {
@@ -46,6 +49,7 @@ function applyRepairs(domain: string): { domain: string; reasons: string[] } {
     if (m) {
       d = d.slice(0, -m[2].length);
       reasons.push(`repaired:strip-after-${tld}`);
+      break; // stop after first TLD strip match
     }
   }
   return { domain: d, reasons };

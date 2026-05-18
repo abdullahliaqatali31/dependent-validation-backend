@@ -4,8 +4,12 @@ import path from 'path';
 dotenv.config();
 dotenv.config({ path: '.env.local', override: true });
 
+if (!process.env.DATABASE_URL) {
+  process.stderr.write('[WARN] DATABASE_URL is not set — using insecure local fallback. Set this env var before deploying to staging/prod.\n');
+}
+
 export const config = {
-  databaseUrl: process.env.DATABASE_URL || 'postgres://csi:csi_password@localhost:5432/csi_db',
+  databaseUrl: process.env.DATABASE_URL || 'postgres://localhost:5432/csi_db',
   redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
   apiPort: Number(process.env.API_PORT || 3000),
   wsPort: Number(process.env.WS_PORT || 3001),
@@ -14,7 +18,7 @@ export const config = {
   supabaseAnonKey: process.env.SUPABASE_ANON_KEY || '',
   supabaseJwtSecret: process.env.SUPABASE_JWT_SECRET || '',
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
-  ninjaKeys: (process.env.NINJA_KEYS || '').split(',').filter(Boolean),
+  ninjaKeys: (process.env.NINJA_KEYS || '').split(',').map(k => k.trim()).filter(Boolean),
   ninjaRateLimit: Number(process.env.NINJA_RATE_LIMIT || 35),
   ninjaIntervalMs: Number(process.env.NINJA_INTERVAL || 30_000),
   ninjaDelayMs: Math.max(170, Math.floor(Number(process.env.NINJA_INTERVAL || 30_000) / Number(process.env.NINJA_RATE_LIMIT || 35))),

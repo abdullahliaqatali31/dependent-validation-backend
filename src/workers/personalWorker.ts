@@ -16,6 +16,7 @@ async function processMaster(masterId: number) {
   if (m.rows.length === 0) return;
   const { domain, batch_id } = m.rows[0];
   const b = await query<{ status: string; paused_stage: string | null }>('SELECT status, paused_stage FROM batches WHERE batch_id=$1', [batch_id]);
+  if (b.rows.length === 0) return; // batch was deleted
   const paused = String(b.rows[0]?.status || '').toLowerCase() === 'paused';
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase();
   if (paused && pausedStage === 'personal') {
@@ -39,9 +40,9 @@ async function processMaster(masterId: number) {
   const emailQ = await query<{ email_normalized: string }>('SELECT email_normalized FROM master_emails WHERE id=$1', [masterId]);
   const email = emailQ.rows[0]?.email_normalized || '';
   if (category === 'personal') {
-    await query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, is_free_pool) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4 FROM master_emails me WHERE me.id=$3', [batch_id, outcome, masterId, isCollector]);
+    await query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, is_free_pool) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4 FROM master_emails me WHERE me.id=$3 ON CONFLICT (master_id) DO NOTHING', [batch_id, outcome, masterId, isCollector]);
   } else {
-    await query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, is_free_pool) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4 FROM master_emails me WHERE me.id=$3', [batch_id, outcome, masterId, isCollector]);
+    await query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, is_free_pool) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4 FROM master_emails me WHERE me.id=$3 ON CONFLICT (master_id) DO NOTHING', [batch_id, outcome, masterId, isCollector]);
   }
   if (isCollector) {
     await query(

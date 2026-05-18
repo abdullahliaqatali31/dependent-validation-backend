@@ -26,7 +26,6 @@ async function run() {
       console.log('Skipping Supabase-only migrations:', skipped.join(', '));
     }
   } else {
-    // Extra safety: if the connected DB does not have the 'auth' schema, skip Supabase-only migrations
     try {
       const res = await pool.query("SELECT schema_name FROM information_schema.schemata WHERE schema_name='auth'");
       const hasAuth = (res?.rowCount || 0) > 0;
@@ -40,12 +39,45 @@ async function run() {
       }
     } catch {}
   }
+
+  // Bootstrap: create applied_migrations table if it doesn't exist
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS applied_migrations (
+      filename TEXT PRIMARY KEY,
+      applied_at TIMESTAMPTZ DEFAULT now()
+    )
+  `);
+
+  // Fetch already-applied migrations
+  const appliedRes = await pool.query<{ filename: string }>('SELECT filename FROM applied_migrations');
+  const applied = new Set(appliedRes.rows.map(r => r.filename));
+
+  let ran = 0;
+  let skipped = 0;
   for (const file of files) {
+    if (applied.has(file)) {
+      console.log(`  Skipping (already applied): ${file}`);
+      skipped++;
+      continue;
+    }
     const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
     console.log(`\nApplying migration: ${file}`);
-    await pool.query(sql);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(sql);
+      await client.query('INSERT INTO applied_migrations(filename) VALUES ($1)', [file]);
+      await client.query('COMMIT');
+      ran++;
+      console.log(`  Done: ${file}`);
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
   }
-  console.log('\nMigrations completed.');
+  console.log(`\nMigrations completed. Applied: ${ran}, Skipped: ${skipped}.`);
   process.exit(0);
 }
 

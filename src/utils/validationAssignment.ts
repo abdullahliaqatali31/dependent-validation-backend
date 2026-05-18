@@ -10,11 +10,10 @@ const BATCH_RR_KEY = (batchId: number) => `val:batch:${batchId}:rr`
 
 export async function waitForBatchTurn(batchId: number): Promise<void> {
   while (true) {
+    // Atomically claim the active slot — SET NX prevents two batches both seeing null and both claiming
+    const claimed = await redis.set(ACTIVE_BATCH_KEY, String(batchId), 'NX')
+    if (claimed) return
     const active = await redis.get(ACTIVE_BATCH_KEY)
-    if (!active) {
-      await redis.set(ACTIVE_BATCH_KEY, String(batchId))
-      return
-    }
     if (Number(active) === batchId) return
     await new Promise(r => setTimeout(r, 1000))
   }
@@ -24,7 +23,8 @@ export async function ensureBatchActivated(batchId: number): Promise<void> {
   const activated = await redis.get(BATCH_ACTIVATED_KEY(batchId))
   if (activated) return
   await waitForBatchTurn(batchId)
-  await redis.set(BATCH_ACTIVATED_KEY(batchId), '1')
+  // SET NX so two concurrent callers don't both think they activated the batch
+  await redis.set(BATCH_ACTIVATED_KEY(batchId), '1', 'NX')
 }
 
 export async function assignWorkerRoundRobin(batchId: number): Promise<number> {

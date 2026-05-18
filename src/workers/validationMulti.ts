@@ -54,6 +54,27 @@ function mapOutcome(message: string, code?: string): 'accepted' | 'catch_all' | 
 }
 
 async function processJob(masterId: number, key: string, workerId: string, workerIdx: number) {
+  // Respect the admin-controlled key status — cache result in Redis for 60 s to avoid per-job DB hit
+  const statusCacheKey = `ninja:key_status:${key}`
+  let keyActive = true
+  const cachedStatus = await redis.get(statusCacheKey)
+  if (cachedStatus !== null) {
+    keyActive = cachedStatus === 'active'
+  } else {
+    try {
+      const ks = await query<{ status: string }>('SELECT status FROM ninja_keys WHERE key=$1', [key])
+      const st = String(ks.rows[0]?.status || 'active').toLowerCase()
+      keyActive = st === 'active'
+      await redis.set(statusCacheKey, st, 'EX', 60)
+    } catch {}
+  }
+  if (!keyActive) {
+    // Re-queue on first worker queue after a delay so a different (active) worker picks it up
+    const q = validationQueues[0]
+    if (q) await q.add('validateEmail', { masterId }, { jobId: `val-${masterId}`, delay: 30000, removeOnComplete: true, removeOnFail: true }).catch(() => {})
+    return
+  }
+
   const m = await query<{ email_normalized: string; batch_id: number; domain: string | null }>('SELECT email_normalized, batch_id, domain FROM master_emails WHERE id=$1', [masterId])
   if (m.rows.length === 0) return
   const email = m.rows[0].email_normalized
@@ -70,10 +91,19 @@ async function processJob(masterId: number, key: string, workerId: string, worke
   const pausedStage = String(b.rows[0]?.paused_stage || '').toLowerCase()
   if (paused && pausedStage === 'validation') {
     const q = validationQueues[workerIdx] || validationQueues[0]
-    try { await q.add('validateEmail', { masterId }, { removeOnComplete: true, removeOnFail: true, delay: 15000 }) } catch {}
+    try { await q.add('validateEmail', { masterId }, { jobId: `val-${masterId}`, removeOnComplete: true, removeOnFail: true, delay: 15000 }) } catch {}
     await publish(CHANNELS.batchProgress, { batchId, stage: 'validation', status: 'paused', master_id: masterId })
     return
   }
+
+  // Pre-check: skip API call if this email already has a definitive validation result.
+  // Only re-validate if the existing outcome is 'timeout' (transient failure worth retrying).
+  const existing = await query<{ outcome: string }>('SELECT outcome FROM validation_results WHERE master_id=$1', [masterId])
+  if (existing.rows.length > 0 && existing.rows[0].outcome !== 'timeout') {
+    await personalQueue.add('personalCheck', { masterId }, { jobId: `split-${masterId}`, removeOnComplete: true, removeOnFail: true })
+    return
+  }
+
   await heartbeat(workerId, key, `${batchId}:${email}`)
   try {
     const data = await verify(email, key)
@@ -127,19 +157,33 @@ async function processJob(masterId: number, key: string, workerId: string, worke
       await publish(CHANNELS.batchProgress, { batchId, step: 'done', stage: 'completed', processed: done, total })
       await releaseBatchAssignment(batchId)
     }
-    await personalQueue.add('personalCheck', { masterId }, { removeOnComplete: true, removeOnFail: true })
+    await personalQueue.add('personalCheck', { masterId }, { jobId: `split-${masterId}`, removeOnComplete: true, removeOnFail: true })
   } catch (e: any) {
-    // If we fail here, we MUST record it so the job doesn't loop forever in QueueWatcher
-    try {
+    // MUST record the result so queueWatcher doesn't loop forever.
+    // Use 'timeout' so the pre-check above allows a future retry (unlike 'rejected' which is final).
+    // Retry the DB insert up to 3 times in case of a transient DB connection issue.
+    const errDetails = JSON.stringify({ error: (e as any)?.message || String(e), ts: Date.now() })
+    let recorded = false
+    for (let attempt = 0; attempt < 3 && !recorded; attempt++) {
+      try {
         await query(
-            `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, outcome, category)
-             VALUES ($1, 'unknown', $2, $3, 'rejected', 'business')
-             ON CONFLICT (master_id) DO NOTHING`,
-            [masterId, JSON.stringify({ error: (e as any)?.message || String(e), ts: Date.now() }), key]
-        );
-    } catch (dbErr) {
-        console.error('Failed to record validation error', dbErr);
+          `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, outcome, category)
+           VALUES ($1, 'unknown', $2, $3, 'timeout', 'business')
+           ON CONFLICT (master_id) DO NOTHING`,
+          [masterId, errDetails, key]
+        )
+        recorded = true
+      } catch (dbErr) {
+        if (attempt < 2) await sleep(500)
+        else console.error('[ValidationWorker] Failed to record error result after 3 attempts', dbErr)
+      }
     }
+
+    // Always forward to split stage — queueWatcher only re-queues emails with NO validation_results;
+    // a 'timeout' result won't be picked up again unless we push it ourselves.
+    try {
+      await personalQueue.add('personalCheck', { masterId }, { jobId: `split-${masterId}`, removeOnComplete: true, removeOnFail: true })
+    } catch {}
 
     await redis.incr(`worker:${workerId}:req_today`)
     if (String(e?.message || '').includes('http_429') || String(e?.message || '').includes('429')) {
@@ -199,6 +243,14 @@ console.log('validationMulti workers started')
             await redis.del(`val:worker:${idx}:batch_id`);
             await redis.del(`val:worker:${idx}:batch_ts`);
             continue;
+          }
+
+          // Don't rebalance if the batch is already terminal or paused
+          const batchStatusQ = await query<{ status: string }>('SELECT status FROM batches WHERE batch_id=$1', [batchId])
+          const batchStatus = String(batchStatusQ.rows[0]?.status || '').toLowerCase()
+          if (!batchStatusQ.rows.length || ['completed', 'cancelled', 'deleted', 'paused'].includes(batchStatus)) {
+            await releaseBatchAssignment(batchId)
+            continue
           }
 
           await releaseBatchAssignment(batchId)

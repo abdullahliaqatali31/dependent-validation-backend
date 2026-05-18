@@ -10,12 +10,13 @@ import { assignWorkerRoundRobin, ensureBatchActivated } from '../utils/validatio
 import { publish, CHANNELS, redis } from '../redis';
 
 async function loadRulesFor(masterId: number) {
-  const m = await query<{ submitter_id: number | null; submitter_team_id: number | null }>(
-    'SELECT submitter_id, submitter_team_id FROM master_emails WHERE id=$1',
+  const m = await query<{ submitter_id: number | null; submitter_team_id: number | null; submitter_uuid: string | null }>(
+    'SELECT submitter_id, submitter_team_id, submitter_uuid FROM master_emails WHERE id=$1',
     [masterId]
   );
-  const { submitter_id, submitter_team_id } = m.rows[0] || { submitter_id: null, submitter_team_id: null };
-  const cacheKey = `${submitter_team_id || 'null'}:${submitter_id || 'null'}`;
+  const { submitter_id, submitter_team_id, submitter_uuid } = m.rows[0] || { submitter_id: null, submitter_team_id: null, submitter_uuid: null };
+  // UUID-based batches have null integer IDs; key on uuid to prevent all such batches sharing one cache entry
+  const cacheKey = `${submitter_uuid || submitter_team_id || 'null'}:${submitter_id || 'null'}`;
   const now = Date.now();
   const cached = (rulesCache.get(cacheKey) || null);
   if (cached && cached.expires > now) return cached.rules;
@@ -41,6 +42,14 @@ async function loadRulesFor(masterId: number) {
 }
 
 const rulesCache: Map<string, { rules: { contains: string[]; endswith: string[]; domains: string[]; excludes: string[] }; expires: number }> = new Map();
+
+// Evict stale entries every 5 minutes to prevent unbounded growth on long-running workers
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rulesCache) {
+    if (v.expires <= now) rulesCache.delete(k);
+  }
+}, 5 * 60 * 1000).unref();
 
 async function processMaster(masterId: number) {
   const m = await query<{ email_normalized: string; email_raw: string | null; domain: string; batch_id: number }>('SELECT email_normalized, email_raw, domain, batch_id FROM master_emails WHERE id=$1', [masterId]);
@@ -87,20 +96,29 @@ async function processMaster(masterId: number) {
   await publish(CHANNELS.batchProgress, { stage: 'filter', status: removed ? 'excluded' : 'passed', master_id: masterId });
   if (removed) return;
 
-  // Check for active batch lock to avoid hanging
+  // If another batch holds the validation lock, queue with delay instead of discarding
   const activeBatchId = await redis.get('val:active_batch_id');
   if (activeBatchId && Number(activeBatchId) !== batchId) {
-     return;
+    const q = validationQueues[0];
+    if (q) {
+      await q.add('validateEmail', { masterId }, {
+        jobId: `val-${masterId}`,
+        delay: 60000,
+        removeOnComplete: true,
+        removeOnFail: true
+      });
+    }
+    return;
   }
 
   try {
     await ensureBatchActivated(batchId);
     const idx = await assignWorkerRoundRobin(batchId);
     const q = validationQueues[idx] || validationQueues[0];
-    await q.add('validateEmail', { masterId }, { removeOnComplete: true, removeOnFail: true });
+    await q.add('validateEmail', { masterId }, { jobId: `val-${masterId}`, removeOnComplete: true, removeOnFail: true });
   } catch {
     const q = validationQueues[0] || undefined;
-    if (q) await q.add('validateEmail', { masterId }, { removeOnComplete: false, removeOnFail: false });
+    if (q) await q.add('validateEmail', { masterId }, { jobId: `val-${masterId}`, removeOnComplete: false, removeOnFail: false });
   }
 }
 

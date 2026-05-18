@@ -52,8 +52,8 @@ async function checkAndResume() {
       const batchId = Number(row.batch_id);
       affectedBatches.add(batchId);
       try {
-        await dedupeQueue.add('dedupeBatch', { batchId }, { 
-            jobId: `dedupe-resume-${batchId}-${Date.now()}`, 
+        await dedupeQueue.add('dedupeBatch', { batchId }, {
+            jobId: `dedupe-${batchId}`,
             removeOnComplete: true,
             removeOnFail: true
         });
@@ -283,36 +283,44 @@ async function checkAndResume() {
     }
 
     if (idleMinutes >= 15) {
-        // Only target the batch that is causing a blockage
         const activeBatchId = await redis.get('val:active_batch_id');
-        
+
         if (activeBatchId) {
             const bId = Number(activeBatchId);
-            console.log(`[QueueWatcher] System idle for 15+ mins AND batch ${bId} is holding lock. Force completing it.`);
-            
-            const b = await query<{ status: string }>('SELECT status FROM batches WHERE batch_id=$1', [bId]);
-            const status = b.rows[0]?.status || 'unknown';
 
-            // Mark as completed
-            await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [bId, 'completed']);
-            
-            // Release lock
-            await releaseBatchAssignment(bId);
-            
-            // Log
-             try {
+            // Verify there are truly no unvalidated emails before force-completing
+            const unvalidatedQ = await query<{ c: string }>(
+              `SELECT COUNT(*) AS c
+               FROM master_emails me
+               JOIN filtered_emails fe ON fe.master_id = me.id
+               LEFT JOIN validation_results vr ON vr.master_id = me.id
+               WHERE me.batch_id = $1 AND fe.status NOT LIKE 'removed:%' AND vr.master_id IS NULL`,
+              [bId]
+            );
+            const unvalidated = Number(unvalidatedQ.rows[0]?.c || 0);
+
+            if (unvalidated > 0) {
+              console.log(`[QueueWatcher] Force-complete skipped: batch ${bId} still has ${unvalidated} unvalidated emails. Resetting idle timer to 10.`);
+              await redis.set(IDLE_KEY, '10');
+            } else {
+              console.log(`[QueueWatcher] System idle for 15+ mins AND batch ${bId} is holding lock. All emails validated. Force completing.`);
+              const b = await query<{ status: string }>('SELECT status FROM batches WHERE batch_id=$1', [bId]);
+              const status = b.rows[0]?.status || 'unknown';
+              await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [bId, 'completed']);
+              await releaseBatchAssignment(bId);
+              try {
                 await query('INSERT INTO audit_logs(action_type, details, resource_ref) VALUES ($1, $2, $3)', [
                     'system_force_complete',
-                    JSON.stringify({ reason: '15_min_idle_blocking', prev_status: status }),
+                    JSON.stringify({ reason: '15_min_idle_blocking', prev_status: status, unvalidated_at_complete: 0 }),
                     String(bId)
                 ]);
-            } catch {}
+              } catch {}
+              await redis.set(IDLE_KEY, '0');
+            }
         } else {
-             console.log('[QueueWatcher] System idle for 15+ mins, but no blocking batch found (val:active_batch_id is empty). No action taken.');
+            console.log('[QueueWatcher] System idle for 15+ mins, but no blocking batch found. No action taken.');
+            await redis.set(IDLE_KEY, '0');
         }
-        
-        // Reset counter after action
-        await redis.set(IDLE_KEY, '0');
     }
 
     activity.batches_affected = Array.from(affectedBatches);

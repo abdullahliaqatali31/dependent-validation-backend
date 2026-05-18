@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import { config } from '../config';
-import { query } from '../db';
+import { query, withTransaction } from '../db';
 import { dedupeQueue, filterQueue } from '../queues';
 import { personalQueue, validationQueue, validationQueues, QUEUE_NAMES } from '../queues';
 import { publish, CHANNELS, redis } from '../redis';
@@ -43,40 +43,85 @@ const supabaseAdmin = (config.supabaseUrl && config.supabaseServiceRoleKey)
   ? createClient(config.supabaseUrl, config.supabaseServiceRoleKey)
   : null;
 
-function getSupabaseUser(req: express.Request): { id?: string; role?: string } {
-  const auth = req.header('authorization') || '';
-  const qToken = (req.query?.token as string) || '';
-  const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : (qToken || null);
-  if (!token) return {};
+function decodeJwtPayload(token: string): any {
   const parts = token.split('.');
   if (parts.length < 2) return {};
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8')) || {};
-    const id = payload.sub || (payload.user && payload.user.id) || undefined;
-    const am = (payload.app_metadata as any) || {};
-    const um = (payload.user_metadata as any) || {};
-    let role: string | undefined = undefined;
-    if (typeof am.role === 'string') role = am.role;
-    else if (typeof um.role === 'string') role = um.role;
-    else if (Array.isArray(am.roles) && am.roles.some((r: any) => String(r || '').toLowerCase() === 'admin')) role = 'admin';
-    else if (Array.isArray(um.roles) && um.roles.some((r: any) => String(r || '').toLowerCase() === 'admin')) role = 'admin';
-    else if (am.is_admin === true || um.is_admin === true || am.isAdmin === true || um.isAdmin === true || am.admin === true || um.admin === true) role = 'admin';
-    return { id, role };
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8')) || {}; } catch { return {}; }
 }
 
-function requireAdmin(req: express.Request, res: express.Response): boolean {
-  const { role } = getSupabaseUser(req);
-  if (String(role || '').toLowerCase() !== 'admin') {
-    res.status(403).json({ error: 'forbidden' });
-    return false;
+async function getVerifiedUser(req: express.Request): Promise<{ id?: string; role?: string } | null> {
+  const auth = req.header('authorization') || '';
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : null;
+  if (!token) return null;
+  if (supabaseAdmin) {
+    try {
+      const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
+      if (error || !user) return null;
+      const am = (user.app_metadata as any) || {};
+      const um = (user.user_metadata as any) || {};
+      let role: string | undefined;
+      if (typeof am.role === 'string') role = am.role;
+      else if (typeof um.role === 'string') role = um.role;
+      else if (Array.isArray(am.roles) && am.roles.some((r: any) => String(r).toLowerCase() === 'admin')) role = 'admin';
+      else if (am.is_admin === true || am.admin === true) role = 'admin';
+      if (!role) {
+        try {
+          const p = await query<{ role: string | null }>('SELECT role FROM profiles WHERE id=$1', [user.id]);
+          if (p.rows[0]?.role) role = p.rows[0].role;
+        } catch {}
+      }
+      return { id: user.id, role };
+    } catch {
+      return null;
+    }
   }
-  return true;
+  // Dev fallback: decode without verification
+  const payload = decodeJwtPayload(token);
+  const id = payload.sub || undefined;
+  const am = payload.app_metadata || {};
+  const um = payload.user_metadata || {};
+  let role: string | undefined;
+  if (typeof am.role === 'string') role = am.role;
+  else if (typeof um.role === 'string') role = um.role;
+  return id ? { id, role } : null;
 }
 
-app.get('/system/health', async (req, res) => {
+// Legacy sync decode — kept for non-security paths only
+function getSupabaseUser(req: express.Request): { id?: string; role?: string } {
+  const auth = req.header('authorization') || '';
+  const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7) : null;
+  if (!token) return {};
+  const payload = decodeJwtPayload(token);
+  return { id: payload.sub || undefined };
+}
+
+async function requireAuth(req: express.Request, res: express.Response): Promise<{ id: string; role?: string } | null> {
+  const user = await getVerifiedUser(req);
+  if (!user?.id) { res.status(401).json({ error: 'unauthorized' }); return null; }
+  return user as { id: string; role?: string };
+}
+
+
+async function requireAdmin(req: express.Request, res: express.Response): Promise<{ id: string; role?: string } | null> {
+  const user = await getVerifiedUser(req);
+  if (!user?.id) { res.status(401).json({ error: 'unauthorized' }); return null; }
+  if (String(user.role || '').toLowerCase() !== 'admin') { res.status(403).json({ error: 'forbidden' }); return null; }
+  return user as { id: string; role?: string };
+}
+
+function escapeLike(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+function csvField(val: string | null | undefined): string {
+  const s = String(val == null ? '' : val);
+  if (s.includes(',') || s.includes('"') || s.includes('\n') || s.includes('\r') || /^[=+\-@\t]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+app.get('/system/health', async (_req, res) => {
   try {
     const start = Date.now();
     await query('SELECT 1');
@@ -108,9 +153,10 @@ app.get('/system/health', async (req, res) => {
 
 app.post('/upload', async (req, res) => {
   try {
-    const { emails, submitter_id, submitter_team_id, submitter_uuid: submitter_uuid_body } = req.body || {};
-    const { id: submitter_uuid_token } = getSupabaseUser(req);
-    const submitter_uuid = submitter_uuid_body || submitter_uuid_token || null;
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const { emails, submitter_id, submitter_team_id } = req.body || {};
+    const submitter_uuid = user.id;
     if (!Array.isArray(emails) || emails.length === 0) {
       return res.status(400).json({ error: 'Provide emails: string[]' });
     }
@@ -122,7 +168,7 @@ app.post('/upload', async (req, res) => {
     const batchId = batch.rows[0].batch_id;
 
     // Bulk insert into staging
-    const values = emails.map((e, i) => `(${batchId}, ${'$' + (i + 1)})`).join(',');
+    const values = emails.map((_e, i) => `(${batchId}, ${'$' + (i + 1)})`).join(',');
     await query(
       `INSERT INTO master_emails_temp(batch_id, email_raw) VALUES ${values}`,
       emails
@@ -147,28 +193,28 @@ async function getBatchCounts(batchId: number) {
     } catch {}
   }
 
-  const staged = await query('SELECT COUNT(*) FROM master_emails_temp WHERE batch_id=$1', [batchId]);
-  const master = await query('SELECT COUNT(*) FROM master_emails WHERE batch_id=$1', [batchId]);
-  const filtered = await query('SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1', [batchId]);
-  const filtered_rules = await query(
-      `SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1 AND status LIKE 'removed:%'`,
-      [batchId]
-  );
-  const filtered_unsub = await query(
-      `SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1 AND reason='unsubscribed'`,
-      [batchId]
-  );
-  const personal = await query('SELECT COUNT(*) FROM personal_emails pe JOIN master_emails me ON pe.master_id=me.id WHERE me.batch_id=$1', [batchId]);
-  const validated = await query('SELECT COUNT(*) FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1', [batchId]);
+  const r = await query<{
+    staged: string; master: string; filtered: string;
+    filtered_rules: string; filtered_unsub: string; personal: string; validated: string;
+  }>(`
+    SELECT
+      (SELECT COUNT(*)::text FROM master_emails_temp WHERE batch_id=$1) AS staged,
+      (SELECT COUNT(*)::text FROM master_emails WHERE batch_id=$1) AS master,
+      (SELECT COUNT(*)::text FROM filtered_emails WHERE batch_id=$1) AS filtered,
+      (SELECT COUNT(*)::text FROM filtered_emails WHERE batch_id=$1 AND status LIKE 'removed:%') AS filtered_rules,
+      (SELECT COUNT(*)::text FROM filtered_emails WHERE batch_id=$1 AND reason='unsubscribed') AS filtered_unsub,
+      (SELECT COUNT(*)::text FROM personal_emails pe JOIN master_emails me ON pe.master_id=me.id WHERE me.batch_id=$1) AS personal,
+      (SELECT COUNT(*)::text FROM validation_results vr JOIN master_emails me ON vr.master_id=me.id WHERE me.batch_id=$1) AS validated
+  `, [batchId]);
 
   const counts = {
-    staged: Number(staged.rows[0].count || 0),
-    master: Number(master.rows[0].count || 0),
-    filtered: Number(filtered.rows[0].count || 0),
-    filtered_rules: Number(filtered_rules.rows[0].count || 0),
-    filtered_unsub: Number(filtered_unsub.rows[0].count || 0),
-    personal: Number(personal.rows[0].count || 0),
-    validated: Number(validated.rows[0].count || 0)
+    staged: Number(r.rows[0]?.staged || 0),
+    master: Number(r.rows[0]?.master || 0),
+    filtered: Number(r.rows[0]?.filtered || 0),
+    filtered_rules: Number(r.rows[0]?.filtered_rules || 0),
+    filtered_unsub: Number(r.rows[0]?.filtered_unsub || 0),
+    personal: Number(r.rows[0]?.personal || 0),
+    validated: Number(r.rows[0]?.validated || 0)
   };
 
   await redis.set(cacheKey, JSON.stringify(counts), 'EX', 5);
@@ -206,10 +252,6 @@ app.get('/batches/:id/steps', async (req, res) => {
     const stagedQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails_temp WHERE batch_id=$1', [id]);
     const masterQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails WHERE batch_id=$1', [id]);
     const filteredQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM filtered_emails WHERE batch_id=$1', [id]);
-    const cleanQ = await query<{ c: string }>(
-      `SELECT COUNT(*) AS c FROM filtered_emails WHERE batch_id=$1 AND (status='clean' OR status LIKE 'repaired:%')`,
-      [id]
-    );
     const passedFilterQ = await query<{ c: string }>(
       `SELECT COUNT(*) AS c FROM filtered_emails WHERE batch_id=$1 AND status NOT LIKE 'removed:%'`,
       [id]
@@ -221,7 +263,6 @@ app.get('/batches/:id/steps', async (req, res) => {
     const staged = Number(stagedQ.rows[0]?.c || 0);
     const master = Number(masterQ.rows[0]?.c || 0);
     const filtered = Number(filteredQ.rows[0]?.c || 0);
-    const cleaned = Number(cleanQ.rows[0]?.c || 0);
     const passedFilter = Number(passedFilterQ.rows[0]?.c || 0);
     const validated = Number(validatedQ.rows[0]?.c || 0);
     const personal = Number(personalQ.rows[0]?.c || 0);
@@ -462,7 +503,7 @@ app.get('/batches/:id/filtration', async (req, res) => {
 });
 
 app.get('/admin/system/watcher', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
   try {
     const lastRun = await redis.get('queue_watcher:last_run');
     const history = await redis.lrange('queue_watcher:history', 0, 49);
@@ -476,7 +517,7 @@ app.get('/admin/system/watcher', async (req, res) => {
 });
 
 // Re-run pipeline for an existing batch: clears downstream tables and re-enqueues filter jobs
-app.get('/collection/pool-stats', async (req, res) => {
+app.get('/collection/pool-stats', async (_req, res) => {
   try {
     const stats = await query<{ category: string, outcome: string, c: string }>(
       `SELECT category, outcome, COUNT(*) AS c 
@@ -522,8 +563,12 @@ app.post('/batches/:id/rerun', async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ error: 'invalid_id' });
   try {
-    const exists = await query('SELECT 1 FROM batches WHERE batch_id=$1', [id]);
-    if (exists.rowCount === 0) return res.status(404).json({ error: 'batch_not_found' });
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const exists = await query<{ submitter_uuid: string | null }>('SELECT submitter_uuid FROM batches WHERE batch_id=$1', [id]);
+    if (!exists.rows[0]) return res.status(404).json({ error: 'batch_not_found' });
+    const isAdmin = String(user.role || '').toLowerCase() === 'admin';
+    if (!isAdmin && String(exists.rows[0].submitter_uuid || '') !== user.id) return res.status(403).json({ error: 'forbidden' });
 
     // Collect master email IDs for this batch
     const masters = await query<{ id: number }>('SELECT id FROM master_emails WHERE batch_id=$1', [id]);
@@ -562,6 +607,8 @@ app.post('/batches/:id/pause', async (req, res) => {
     return res.status(400).json({ error: 'invalid_id_or_stage' });
   }
   try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
     await query('UPDATE batches SET status=$2, paused_stage=$3, paused_at=now() WHERE batch_id=$1', [id, 'paused', stage]);
     await publish(CHANNELS.batchProgress, { batchId: id, stage: 'paused', paused_stage: stage });
     res.json({ ok: true, batchId: id, stage });
@@ -574,6 +621,8 @@ app.post('/batches/:id/resume', async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ error: 'invalid_id' });
   try {
+    const user = await requireAuth(req, res);
+    if (!user) return;
     const b = await query<{ paused_stage: string | null }>('SELECT paused_stage FROM batches WHERE batch_id=$1', [id]);
     const stage = String(b.rows[0]?.paused_stage || '').toLowerCase();
     if (!['dedupe','filter','validation','personal'].includes(stage)) {
@@ -611,19 +660,24 @@ app.post('/batches/:id/resume', async (req, res) => {
         [id]
       );
       for (const r of masters.rows) {
-        await validationQueue.add('validateEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
+        await validationQueue.add('validateEmail', { masterId: r.id }, { jobId: `val-${r.id}`, removeOnComplete: true, removeOnFail: true });
       }
     } else if (stage === 'personal') {
       const masters = await query<{ id: number }>(
-        `SELECT me.id
-         FROM master_emails me
-         WHERE me.batch_id=$1
-           AND EXISTS (SELECT 1 FROM validation_results vr WHERE vr.master_id=me.id)
-           AND NOT EXISTS (SELECT 1 FROM personal_emails pe WHERE pe.master_id=me.id)`,
+        `SELECT vr.master_id AS id
+         FROM validation_results vr
+         JOIN master_emails me ON vr.master_id = me.id
+         LEFT JOIN final_personal_emails fpe ON fpe.master_id = me.id
+         LEFT JOIN final_business_emails fbe ON fbe.master_id = me.id
+         WHERE me.batch_id=$1 AND fpe.id IS NULL AND fbe.id IS NULL`,
         [id]
       );
       for (const r of masters.rows) {
-        await publish(CHANNELS.batchProgress, { batchId: id, stage: 'resume_enqueue', master_id: r.id });
+        await personalQueue.add('personalCheck', { masterId: r.id }, {
+          jobId: `split-${r.id}`,
+          removeOnComplete: true,
+          removeOnFail: true
+        });
       }
     }
 
@@ -688,7 +742,7 @@ app.post('/batches/:id/unstick', async (req, res) => {
       for (const r of valPending.rows) {
         const idx = await assignWorkerRoundRobin(id);
         const q = validationQueues[idx] || validationQueues[0];
-        await q.add('validateEmail', { masterId: r.id }, { removeOnComplete: true, removeOnFail: true });
+        await q.add('validateEmail', { masterId: r.id }, { jobId: `val-${r.id}`, removeOnComplete: true, removeOnFail: true });
         valEnq++;
       }
     }
@@ -708,7 +762,7 @@ app.get('/employee/results', async (req, res) => {
     const q = String((req.query.q || '').toString());
     if (!employeeId) return res.status(400).json({ error: 'missing_employee_id' });
 
-    const like = q ? `%${q}%` : '';
+    const like = q ? `%${escapeLike(q)}%` : '';
 
     if (type === 'valid') {
       const rows = await query<{ email: string }>(
@@ -717,7 +771,7 @@ app.get('/employee/results', async (req, res) => {
          JOIN master_emails me ON vr.master_id = me.id
          WHERE me.submitter_uuid = $1
            AND vr.status_enum IN ('valid','catch_all')
-           AND ($2::text = '' OR me.email_normalized ILIKE $2)
+           AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
          ORDER BY vr.validated_at DESC
          LIMIT 500`,
         [employeeId, like]
@@ -733,7 +787,7 @@ app.get('/employee/results', async (req, res) => {
          JOIN master_emails me ON vr.master_id = me.id
          WHERE me.submitter_uuid = $1
            AND vr.status_enum = 'invalid'
-           AND ($2::text = '' OR me.email_normalized ILIKE $2)
+           AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
          ORDER BY vr.validated_at DESC
          LIMIT 500`,
         [employeeId, like]
@@ -747,7 +801,7 @@ app.get('/employee/results', async (req, res) => {
        FROM personal_emails pe
        JOIN master_emails me ON pe.master_id = me.id
        WHERE me.submitter_uuid = $1
-         AND ($2::text = '' OR me.email_normalized ILIKE $2)
+         AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
        ORDER BY me.created_at DESC
        LIMIT 500`,
       [employeeId, like]
@@ -758,7 +812,7 @@ app.get('/employee/results', async (req, res) => {
        JOIN master_emails me ON vr.master_id = me.id
        WHERE me.submitter_uuid = $1
          AND vr.status_enum = 'timeout'
-         AND ($2::text = '' OR me.email_normalized ILIKE $2)
+         AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
        ORDER BY vr.validated_at DESC
        LIMIT 500`,
       [employeeId, like]
@@ -994,7 +1048,7 @@ app.get('/employee/results/export', async (req, res) => {
     const type = String((req.query.type || 'valid').toString()).toLowerCase();
     const q = String((req.query.q || '').toString());
     if (!employeeId) return res.status(400).send('missing_employee_id');
-    const like = q ? `%${q}%` : '';
+    const like = q ? `%${escapeLike(q)}%` : '';
 
     let rows: { email: string; reason?: string | null }[] = [];
     if (type === 'valid') {
@@ -1004,7 +1058,7 @@ app.get('/employee/results/export', async (req, res) => {
          JOIN master_emails me ON vr.master_id = me.id
          WHERE me.submitter_uuid = $1
            AND vr.status_enum IN ('valid','catch_all')
-           AND ($2::text = '' OR me.email_normalized ILIKE $2)
+           AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
          ORDER BY vr.validated_at DESC`,
         [employeeId, like]
       );
@@ -1017,7 +1071,7 @@ app.get('/employee/results/export', async (req, res) => {
          JOIN master_emails me ON vr.master_id = me.id
          WHERE me.submitter_uuid = $1
            AND vr.status_enum = 'invalid'
-           AND ($2::text = '' OR me.email_normalized ILIKE $2)
+           AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
          ORDER BY vr.validated_at DESC`,
         [employeeId, like]
       );
@@ -1028,7 +1082,7 @@ app.get('/employee/results/export', async (req, res) => {
          FROM personal_emails pe
          JOIN master_emails me ON pe.master_id = me.id
          WHERE me.submitter_uuid = $1
-           AND ($2::text = '' OR me.email_normalized ILIKE $2)
+           AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
          ORDER BY me.created_at DESC`,
         [employeeId, like]
       );
@@ -1038,7 +1092,7 @@ app.get('/employee/results/export', async (req, res) => {
          JOIN master_emails me ON vr.master_id = me.id
          WHERE me.submitter_uuid = $1
            AND vr.status_enum = 'timeout'
-           AND ($2::text = '' OR me.email_normalized ILIKE $2)
+           AND ($2::text = '' OR me.email_normalized ILIKE $2 ESCAPE '\\')
          ORDER BY vr.validated_at DESC`,
         [employeeId, like]
       );
@@ -1059,9 +1113,11 @@ app.get('/employee/results/export', async (req, res) => {
 
 app.get('/employee/validation/download/all', async (req, res) => {
   try {
-    const { id: employeeUuid, role } = getSupabaseUser(req);
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const { id: employeeUuid, role } = user;
     const batchId = Number((req.query.batch_id || 0));
-    if (!employeeUuid || !batchId) return res.status(400).send('missing_employee_or_batch');
+    if (!batchId) return res.status(400).send('missing_batch');
     const b = await query<{ submitter_uuid: string | null }>('SELECT submitter_uuid FROM batches WHERE batch_id=$1', [batchId]);
     const owner = String(b.rows[0]?.submitter_uuid || '');
     if (String(role || '').toLowerCase() !== 'admin' && owner !== String(employeeUuid)) return res.status(403).send('forbidden');
@@ -1096,31 +1152,43 @@ app.get('/employee/validation/download/all', async (req, res) => {
     const ids = allRows.map(r => r.id);
     const header = 'email,domain,status,category,first_found_at,batch_id,validated_at,downloaded_at\n';
     const ts = new Date().toISOString();
-    const body = allRows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.first_found_at ? new Date(r.first_found_at).toISOString() : ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''},${ts}`).join('\n');
+    const body = allRows.map(r => [
+      csvField(r.email), csvField(r.domain), csvField(r.status), csvField(r.category),
+      r.first_found_at ? new Date(r.first_found_at).toISOString() : '',
+      String(r.batch_id),
+      r.validated_at ? new Date(r.validated_at).toISOString() : '',
+      ts
+    ].join(',')).join('\n');
     const csv = header + body;
-    const dir = require('path').join(require('../config').config.downloadDir, String(employeeUuid), String(batchId), String(Date.now()));
-    require('fs').mkdirSync(dir, { recursive: true });
-    const file = require('path').join(dir, `all.csv`);
-    require('fs').writeFileSync(file, csv);
-    await query('BEGIN');
-    await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_batch_id=$2, downloaded_by=$3 WHERE id = ANY($1::bigint[])', [ids, batchId, employeeUuid]);
-    await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [batchId, employeeUuid, 'all', file, allRows.length]);
-    await query('COMMIT');
+    const pathMod = require('path');
+    const fsMod = require('fs');
+    const downloadBase = pathMod.resolve(require('../config').config.downloadDir);
+    const safeUuid = String(employeeUuid).replace(/[^a-zA-Z0-9\-]/g, '');
+    const dir = pathMod.resolve(downloadBase, safeUuid, String(batchId), String(Date.now()));
+    if (!dir.startsWith(downloadBase)) return res.status(400).send('invalid_path');
+    fsMod.mkdirSync(dir, { recursive: true });
+    const file = pathMod.join(dir, 'all.csv');
+    fsMod.writeFileSync(file, csv);
+    await withTransaction(async (client) => {
+      await client.query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_batch_id=$2, downloaded_by=$3 WHERE id = ANY($1::bigint[])', [ids, batchId, employeeUuid]);
+      await client.query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [batchId, employeeUuid, 'all', file, allRows.length]);
+    });
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="batch_${batchId}_all.csv"`);
     res.send(csv);
   } catch (err: any) {
-    try { await query('ROLLBACK'); } catch {}
     res.status(500).send('employee_download_all_failed');
   }
 });
 
 app.get('/employee/validation/download/:type', async (req, res) => {
   try {
-    const { id: employeeUuid, role } = getSupabaseUser(req);
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const { id: employeeUuid, role } = user;
     const batchId = Number((req.query.batch_id || 0));
     const type = String(req.params.type || '').toLowerCase();
-    if (!employeeUuid || !batchId) return res.status(400).send('missing_employee_or_batch');
+    if (!batchId) return res.status(400).send('missing_batch');
     const b = await query<{ submitter_uuid: string | null }>('SELECT submitter_uuid FROM batches WHERE batch_id=$1', [batchId]);
     const owner = String(b.rows[0]?.submitter_uuid || '');
     if (String(role || '').toLowerCase() !== 'admin' && owner !== String(employeeUuid)) return res.status(403).send('forbidden');
@@ -1155,21 +1223,31 @@ app.get('/employee/validation/download/:type', async (req, res) => {
     const ids = rows.rows.map(r => r.id);
     const header = 'email,domain,status,category,first_found_at,batch_id,validated_at,downloaded_at\n';
     const ts = new Date().toISOString();
-    const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.first_found_at ? new Date(r.first_found_at).toISOString() : ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''},${ts}`).join('\n');
+    const body = rows.rows.map(r => [
+      csvField(r.email), csvField(r.domain), csvField(r.status), csvField(r.category),
+      r.first_found_at ? new Date(r.first_found_at).toISOString() : '',
+      String(r.batch_id),
+      r.validated_at ? new Date(r.validated_at).toISOString() : '',
+      ts
+    ].join(',')).join('\n');
     const csv = header + body;
-    const dir = require('path').join(require('../config').config.downloadDir, String(employeeUuid), String(batchId), String(Date.now()));
-    require('fs').mkdirSync(dir, { recursive: true });
-    const file = require('path').join(dir, `${sel.name}.csv`);
-    require('fs').writeFileSync(file, csv);
-    await query('BEGIN');
-    await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_batch_id=$2, downloaded_by=$3 WHERE id = ANY($1::bigint[])', [ids, batchId, employeeUuid]);
-    await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [batchId, employeeUuid, sel.name, file, rows.rows.length]);
-    await query('COMMIT');
+    const pathMod = require('path');
+    const fsMod = require('fs');
+    const downloadBase = pathMod.resolve(require('../config').config.downloadDir);
+    const safeUuid = String(employeeUuid).replace(/[^a-zA-Z0-9\-]/g, '');
+    const dir = pathMod.resolve(downloadBase, safeUuid, String(batchId), String(Date.now()));
+    if (!dir.startsWith(downloadBase)) return res.status(400).send('invalid_path');
+    fsMod.mkdirSync(dir, { recursive: true });
+    const file = pathMod.join(dir, `${sel.name}.csv`);
+    fsMod.writeFileSync(file, csv);
+    await withTransaction(async (client) => {
+      await client.query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_batch_id=$2, downloaded_by=$3 WHERE id = ANY($1::bigint[])', [ids, batchId, employeeUuid]);
+      await client.query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [batchId, employeeUuid, sel.name, file, rows.rows.length]);
+    });
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="batch_${batchId}_${sel.name}.csv"`);
     res.send(csv);
   } catch (err: any) {
-    try { await query('ROLLBACK'); } catch {}
     res.status(500).send('employee_download_type_failed');
   }
 });
@@ -1227,8 +1305,8 @@ app.get('/employee/validation/export-all', async (req, res) => {
       `;
     }
     if (q) {
-      params.push(`%${q}%`);
-      sql += ` ${source ? 'AND' : 'WHERE'} email ILIKE $${params.length}`;
+      params.push(`%${escapeLike(String(q))}%`);
+      sql += ` ${source ? 'AND' : 'WHERE'} email ILIKE $${params.length} ESCAPE '\\'`;
     }
     sql += ` ORDER BY validated_at DESC`;
 
@@ -1250,26 +1328,39 @@ app.get('/employee/validation/export-all', async (req, res) => {
 
     const header = 'email,domain,status,category,first_found_at,batch_id,validated_at,downloaded_at\n';
     const ts = new Date().toISOString();
-    const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.first_found_at ? new Date(r.first_found_at).toISOString() : ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''},${ts}`).join('\n');
+    const body = rows.rows.map(r => [
+      csvField(r.email), csvField(r.domain), csvField(r.status), csvField(r.category),
+      csvField(r.first_found_at ? new Date(r.first_found_at).toISOString() : ''),
+      csvField(String(r.batch_id)),
+      csvField(r.validated_at ? new Date(r.validated_at).toISOString() : ''),
+      csvField(ts)
+    ].join(',')).join('\n');
     const csv = header + body;
-    const dir = require('path').join(require('../config').config.downloadDir, String(employeeUuid), 'global', String(Date.now()));
-    require('fs').mkdirSync(dir, { recursive: true });
-    const file = require('path').join(dir, `all_results.csv`);
-    require('fs').writeFileSync(file, csv);
-    await query('BEGIN');
-    if (vIds.length > 0) {
-      await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [vIds, employeeUuid]);
-    }
-    if (fpIds.length > 0) {
-      await query('UPDATE free_pool SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [fpIds, employeeUuid]);
-    }
-    await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, 'global_all', file, rows.rows.length]);
-    await query('COMMIT');
+
+    const nodePath = require('path') as typeof import('path');
+    const fs = require('fs') as typeof import('fs');
+    const downloadBase = nodePath.resolve(config.downloadDir);
+    const safeUuid = String(employeeUuid).replace(/[^a-zA-Z0-9_-]/g, '');
+    const dir = nodePath.resolve(downloadBase, safeUuid, 'global', String(Date.now()));
+    if (!dir.startsWith(downloadBase + nodePath.sep)) return res.status(400).send('invalid_path');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = nodePath.join(dir, 'all_results.csv');
+    fs.writeFileSync(file, csv);
+
+    await withTransaction(async (client) => {
+      if (vIds.length > 0) {
+        await client.query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [vIds, employeeUuid]);
+      }
+      if (fpIds.length > 0) {
+        await client.query('UPDATE free_pool SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [fpIds, employeeUuid]);
+      }
+      await client.query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, 'global_all', file, rows.rows.length]);
+    });
+
     res.setHeader('Content-Type', 'text/csv');
     res.setHeader('Content-Disposition', `attachment; filename="all_results_${Date.now()}.csv"`);
     res.send(csv);
   } catch (err: any) {
-    try { await query('ROLLBACK'); } catch {}
     console.error(err);
     res.status(500).send('export_all_failed');
   }
@@ -1319,8 +1410,8 @@ app.get('/employee/validation/export-category', async (req, res) => {
       `;
     }
     if (q) {
-      params.push(`%${q}%`);
-      sql += ` ${source ? 'AND' : 'WHERE'} email ILIKE $${params.length}`;
+      params.push(`%${escapeLike(String(q))}%`);
+      sql += ` ${source ? 'AND' : 'WHERE'} email ILIKE $${params.length} ESCAPE '\\'`;
     }
     sql += ` ORDER BY validated_at DESC`;
 
@@ -1341,26 +1432,39 @@ app.get('/employee/validation/export-category', async (req, res) => {
     const fpIds = rows.rows.filter(r => r.source === 'free_pool' && r.id != null).map(r => r.id);
 
     const header = 'email,domain,status,category,batch_id,validated_at\n';
-    const body = rows.rows.map(r => `${r.email || ''},${r.domain || ''},${r.status || ''},${r.category || ''},${r.batch_id},${r.validated_at ? new Date(r.validated_at).toISOString() : ''}`).join('\n');
+    const body = rows.rows.map(r => [
+      csvField(r.email), csvField(r.domain), csvField(r.status), csvField(r.category),
+      csvField(String(r.batch_id)),
+      csvField(r.validated_at ? new Date(r.validated_at).toISOString() : '')
+    ].join(',')).join('\n');
     const csv = header + body;
-    const dir = require('path').join(require('../config').config.downloadDir, String(employeeUuid), 'global', String(Date.now()));
-    require('fs').mkdirSync(dir, { recursive: true });
-    const file = require('path').join(dir, `${category}_${outcome}.csv`);
-    require('fs').writeFileSync(file, csv);
-    await query('BEGIN');
-    if (vIds.length > 0) {
-      await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [vIds, employeeUuid]);
-    }
-    if (fpIds.length > 0) {
-      await query('UPDATE free_pool SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [fpIds, employeeUuid]);
-    }
-    await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, `${category}_${outcome}`, file, rows.rows.length]);
-    await query('COMMIT');
+
+    const nodePath = require('path') as typeof import('path');
+    const fs = require('fs') as typeof import('fs');
+    const downloadBase = nodePath.resolve(config.downloadDir);
+    const safeUuid = String(employeeUuid).replace(/[^a-zA-Z0-9_-]/g, '');
+    const safeCat = String(category || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const safeOut = String(outcome || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const dir = nodePath.resolve(downloadBase, safeUuid, 'category', String(Date.now()));
+    if (!dir.startsWith(downloadBase + nodePath.sep)) return res.status(400).send('invalid_path');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = nodePath.join(dir, `${safeCat}_${safeOut}.csv`);
+    fs.writeFileSync(file, csv);
+
+    await withTransaction(async (client) => {
+      if (vIds.length > 0) {
+        await client.query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [vIds, employeeUuid]);
+      }
+      if (fpIds.length > 0) {
+        await client.query('UPDATE free_pool SET is_downloaded=true, downloaded_at=now(), downloaded_by=$2 WHERE id = ANY($1::bigint[])', [fpIds, employeeUuid]);
+      }
+      await client.query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [0, employeeUuid, `${safeCat}_${safeOut}`, file, rows.rows.length]);
+    });
+
     res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', `attachment; filename="${category}_${outcome}_${Date.now()}.csv"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeCat}_${safeOut}_${Date.now()}.csv"`);
     res.send(csv);
   } catch (err: any) {
-    try { await query('ROLLBACK'); } catch {}
     console.error(err);
     res.status(500).send('export_category_failed');
   }
@@ -1368,36 +1472,38 @@ app.get('/employee/validation/export-category', async (req, res) => {
 
 app.post('/employee/validation/mark-downloaded', async (req, res) => {
   try {
-    const { id: employeeUuid, role } = getSupabaseUser(req);
+    const user = await requireAuth(req, res);
+    if (!user) return;
     const { batch_id, email_ids, download_type, file_path } = req.body || {};
     const batchId = Number(batch_id || 0);
     const ids = Array.isArray(email_ids) ? email_ids.map((x: any) => Number(x)).filter((n: number) => Number.isFinite(n) && n > 0) : [];
     const type = String(download_type || '');
-    if (!employeeUuid || !batchId || ids.length === 0 || !type) return res.status(400).json({ error: 'invalid_body' });
+    if (!batchId || ids.length === 0 || !type) return res.status(400).json({ error: 'invalid_body' });
     const b = await query<{ submitter_uuid: string | null }>('SELECT submitter_uuid FROM batches WHERE batch_id=$1', [batchId]);
     const owner = String(b.rows[0]?.submitter_uuid || '');
-    if (String(role || '').toLowerCase() !== 'admin' && owner !== String(employeeUuid)) return res.status(403).json({ error: 'forbidden' });
-    await query('BEGIN');
-    await query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_batch_id=$2, downloaded_by=$3 WHERE id = ANY($1::bigint[])', [ids, batchId, employeeUuid]);
-    await query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [batchId, employeeUuid, type, String(file_path || ''), ids.length]);
-    await query('COMMIT');
+    if (String(user.role || '').toLowerCase() !== 'admin' && owner !== String(user.id)) return res.status(403).json({ error: 'forbidden' });
+    await withTransaction(async (client) => {
+      await client.query('UPDATE validation_results SET is_downloaded=true, downloaded_at=now(), downloaded_batch_id=$2, downloaded_by=$3 WHERE id = ANY($1::bigint[])', [ids, batchId, user.id]);
+      await client.query('INSERT INTO download_history(batch_id, employee_uuid, download_type, file_path, total_downloaded) VALUES ($1, $2, $3, $4, $5)', [batchId, user.id, type, String(file_path || ''), ids.length]);
+    });
     res.json({ ok: true, marked: ids.length });
   } catch (err: any) {
-    try { await query('ROLLBACK'); } catch {}
     res.status(500).json({ error: 'employee_mark_downloaded_failed', details: err.message });
   }
 });
 
 app.get('/employee/download-history', async (req, res) => {
   try {
-    const { id: employeeUuid, role } = getSupabaseUser(req);
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const employeeUuid = user.id;
+    const isAdmin = String(user.role || '').toLowerCase() === 'admin';
     const page = Math.max(1, Number((req.query.page || 1)));
     const pageSize = Math.min(100, Math.max(1, Number((req.query.page_size || 20))));
     const batchId = Number((req.query.batch_id || 0));
     const type = String((req.query.type || '')).toLowerCase();
     const start = String((req.query.start_date || ''));
     const end = String((req.query.end_date || ''));
-    const isAdmin = String(role || '').toLowerCase() === 'admin';
     const params: any[] = [];
     let sql = `SELECT id, batch_id, employee_uuid, download_type, file_path, total_downloaded, created_at FROM download_history`;
     const where: string[] = [];
@@ -1437,13 +1543,17 @@ app.get('/employee/download-history/file/:id', async (req, res) => {
   }
 });
 
-// Employee: activity logs (basic)
+// Employee: activity logs
 app.get('/employee/logs', async (req, res) => {
   try {
-    // Note: audit_logs uses BIGINT actor_id; Supabase UUID is not directly stored yet.
-    // For now, return recent system logs. Future enhancement: link actor UUIDs to logs.
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const isAdmin = String(user.role || '').toLowerCase() === 'admin';
     const rows = await query<{ created_at: string; action_type: string; details: any }>(
-      `SELECT created_at, action_type, details FROM audit_logs ORDER BY created_at DESC LIMIT 100`
+      isAdmin
+        ? `SELECT created_at, action_type, details FROM audit_logs ORDER BY created_at DESC LIMIT 100`
+        : `SELECT created_at, action_type, details FROM audit_logs WHERE details->>'employee_uuid' = $1 OR details->>'actor_uuid' = $1 ORDER BY created_at DESC LIMIT 100`,
+      isAdmin ? [] : [user.id]
     );
     const result = rows.rows.map(r => ({
       time: r.created_at,
@@ -1460,6 +1570,7 @@ app.get('/employee/logs', async (req, res) => {
 
 // Admin: batches list with progress stats
 app.get('/admin/batches', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const limit = Number(req.query.limit || 20);
     const offset = Number(req.query.offset || 0);
@@ -1508,6 +1619,17 @@ app.get('/admin/batches', async (req, res) => {
     queryStr += ` OFFSET $${params.length}`;
 
     const batches = await query(queryStr, params);
+
+    // Count query reuses same WHERE conditions but without LIMIT/OFFSET
+    const countParams = params.slice(0, params.length - 2); // drop limit + offset
+    const countStr = queryStr
+      .replace(/SELECT \* FROM/, 'SELECT COUNT(*) AS total FROM')
+      .replace(/ ORDER BY created_at DESC/, '')
+      .replace(/ LIMIT \$\d+/, '')
+      .replace(/ OFFSET \$\d+/, '');
+    const countRes = await query<{ total: string }>(countStr, countParams);
+    const totalCount = Number(countRes.rows[0]?.total || 0);
+
     const result = [] as any[];
     for (const b of batches.rows as any[]) {
       const id = b.batch_id;
@@ -1522,14 +1644,15 @@ app.get('/admin/batches', async (req, res) => {
         }
       });
     }
-    res.json(result);
+    res.json({ batches: result, total: totalCount, limit, offset });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_batches_failed', details: err.message });
   }
 });
 
 // Admin: employees summary
-app.get('/admin/employees', async (_req, res) => {
+app.get('/admin/employees', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const rows = await query(
       `SELECT submitter_id AS employee_id,
@@ -1549,6 +1672,7 @@ app.get('/admin/employees', async (_req, res) => {
 
 // Admin: rules CRUD
 app.get('/admin/rules', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   const { scope, employee_id, team_id } = req.query;
   try {
     const rows = await query(
@@ -1566,6 +1690,7 @@ app.get('/admin/rules', async (req, res) => {
 });
 
 app.post('/admin/rules', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const { scope, employee_id, team_id, contains, endswith, domains, excludes, priority } = req.body || {};
     const row = await query(
@@ -1591,6 +1716,7 @@ app.post('/admin/rules', async (req, res) => {
 });
 
 app.put('/admin/rules/:id', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const id = Number(req.params.id);
     const { contains, endswith, domains, excludes, priority } = req.body || {};
@@ -1613,6 +1739,7 @@ app.put('/admin/rules/:id', async (req, res) => {
 });
 
 app.delete('/admin/rules/:id', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const id = Number(req.params.id);
     await query('DELETE FROM rules WHERE id=$1', [id]);
@@ -1624,7 +1751,8 @@ app.delete('/admin/rules/:id', async (req, res) => {
 });
 
 // Admin: overview stats
-app.get('/admin/overview', async (_req, res) => {
+app.get('/admin/overview', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const totalBatches = await query('SELECT COUNT(*) FROM batches');
     const totalMaster = await query('SELECT COUNT(*) FROM master_emails');
@@ -1703,7 +1831,7 @@ app.get('/admin/overview', async (_req, res) => {
 
 // Admin: users list
 app.get('/admin/users', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
   try {
     const rows = await query(
       `SELECT id, email, full_name, avatar_url, role, created_at, updated_at
@@ -1719,7 +1847,7 @@ app.get('/admin/users', async (req, res) => {
 
 // Admin: create user
 app.post('/admin/users', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
   try {
     const { email, password, full_name, role } = req.body || {};
     if (!email || !password) {
@@ -1762,7 +1890,7 @@ app.post('/admin/users', async (req, res) => {
 
 // Admin: update user role
 app.put('/admin/users/:id/role', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
   try {
     const id = String(req.params.id || '');
     const { role } = req.body || {};
@@ -1790,7 +1918,7 @@ app.put('/admin/users/:id/role', async (req, res) => {
 
 // Admin: delete user (Auth + Profiles)
 app.delete('/admin/users/:id', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
   try {
     const id = String(req.params.id || '');
     if (!id) return res.status(400).json({ error: 'missing_user_id' });
@@ -1813,11 +1941,13 @@ app.delete('/admin/users/:id', async (req, res) => {
   }
 });
 
-// Admin: control actions (stub)
+// Admin: control actions
 app.post('/admin/control/:action', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
+    const ALLOWED_ACTIONS = ['pause_all', 'resume_all', 'stop_validation', 'start_validation', 'clear_queues'];
     const action = String(req.params.action || '').toLowerCase();
-    // Publish a control message for future consumers; currently informational
+    if (!ALLOWED_ACTIONS.includes(action)) return res.status(400).json({ error: 'invalid_action', allowed: ALLOWED_ACTIONS });
     await publish(CHANNELS.batchProgress, { stage: 'admin_control', action });
     res.json({ ok: true, action });
   } catch (err: any) {
@@ -1826,7 +1956,8 @@ app.post('/admin/control/:action', async (req, res) => {
 });
 
 // Admin: unsubscribes
-app.get('/admin/unsubscribes/emails', async (_req, res) => {
+app.get('/admin/unsubscribes/emails', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const rows = await query('SELECT * FROM unsubscribe_list ORDER BY added_at DESC');
     res.json(rows.rows);
@@ -1835,7 +1966,8 @@ app.get('/admin/unsubscribes/emails', async (_req, res) => {
   }
 });
 
-app.get('/admin/unsubscribes/domains', async (_req, res) => {
+app.get('/admin/unsubscribes/domains', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const rows = await query('SELECT * FROM unsubscribe_domains ORDER BY added_at DESC');
     res.json(rows.rows);
@@ -1845,13 +1977,15 @@ app.get('/admin/unsubscribes/domains', async (_req, res) => {
 });
 
 app.post('/admin/unsubscribes/emails', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const { emails, user_id } = req.body || {};
     if (!Array.isArray(emails) || emails.length === 0)
       return res.status(400).json({ error: 'emails_required' });
-    const values = emails.map((e, i) => `($${i + 1}, ${user_id || 'NULL'})`).join(',');
-    await query(`INSERT INTO unsubscribe_list(email, added_by) VALUES ${values} ON CONFLICT (email) DO NOTHING`, emails);
-    await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['unsub_emails_upload', user_id || null, JSON.stringify({ count: emails.length })]);
+    const userId = user_id ? String(user_id) : null;
+    const values = emails.map((_, i) => `($${i + 1}, $${emails.length + 1})`).join(',');
+    await query(`INSERT INTO unsubscribe_list(email, added_by) VALUES ${values} ON CONFLICT (email) DO NOTHING`, [...emails, userId]);
+    await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['unsub_emails_upload', null, JSON.stringify({ count: emails.length })]);
     res.json({ inserted: emails.length });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_unsub_emails_upload_failed', details: err.message });
@@ -1859,13 +1993,15 @@ app.post('/admin/unsubscribes/emails', async (req, res) => {
 });
 
 app.post('/admin/unsubscribes/domains', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const { domains, user_id } = req.body || {};
     if (!Array.isArray(domains) || domains.length === 0)
       return res.status(400).json({ error: 'domains_required' });
-    const values = domains.map((d, i) => `($${i + 1}, ${user_id || 'NULL'})`).join(',');
-    await query(`INSERT INTO unsubscribe_domains(domain, added_by) VALUES ${values} ON CONFLICT (domain) DO NOTHING`, domains);
-    await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['unsub_domains_upload', user_id || null, JSON.stringify({ count: domains.length })]);
+    const userId = user_id ? String(user_id) : null;
+    const values = domains.map((_, i) => `($${i + 1}, $${domains.length + 1})`).join(',');
+    await query(`INSERT INTO unsubscribe_domains(domain, added_by) VALUES ${values} ON CONFLICT (domain) DO NOTHING`, [...domains, userId]);
+    await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['unsub_domains_upload', null, JSON.stringify({ count: domains.length })]);
     res.json({ inserted: domains.length });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_unsub_domains_upload_failed', details: err.message });
@@ -2004,15 +2140,24 @@ app.post('/employee/filter/unsub/process', async (req, res) => {
     const list = Array.isArray(emails) ? emails : (typeof emails === 'string' ? [emails] : []);
     if (list.length === 0) return res.status(400).json({ error: 'emails_required' });
     // Normalize a bit: trim and lowercase
-    const cleaned = list.map((e: string) => (e || '').trim()).filter(Boolean);
-    // Load unsub tables
-    const unsubEmailsQ = await query<{ email: string }>('SELECT email FROM unsubscribe_list');
-    const unsubDomainsQ = await query<{ domain: string }>('SELECT domain FROM unsubscribe_domains');
-    const unsubEmails = new Set(unsubEmailsQ.rows.map(r => r.email.toLowerCase()));
-    const unsubDomains = new Set(unsubDomainsQ.rows.map(r => r.domain.toLowerCase()));
+    const cleaned = list.map((e: string) => (e || '').trim().toLowerCase()).filter(Boolean);
+    const domains = [...new Set(cleaned.map((lc: string) => { const at = lc.indexOf('@'); return at >= 0 ? lc.slice(at + 1) : ''; }).filter(Boolean))];
+
+    // Query only the emails and domains that appear in the submitted list — avoids full-table scan
+    const [unsubEmailsQ, unsubDomainsQ] = await Promise.all([
+      cleaned.length > 0
+        ? query<{ email: string }>(`SELECT email FROM unsubscribe_list WHERE email = ANY($1::text[])`, [cleaned])
+        : Promise.resolve({ rows: [] as { email: string }[] }),
+      domains.length > 0
+        ? query<{ domain: string }>(`SELECT domain FROM unsubscribe_domains WHERE domain = ANY($1::text[])`, [domains])
+        : Promise.resolve({ rows: [] as { domain: string }[] }),
+    ]);
+    const unsubEmails = new Set(unsubEmailsQ.rows.map((r: { email: string }) => r.email.toLowerCase()));
+    const unsubDomains = new Set(unsubDomainsQ.rows.map((r: { domain: string }) => r.domain.toLowerCase()));
+
     const kept: string[] = [];
     const filteredOut: string[] = [];
-    for (const raw of cleaned) {
+    for (const raw of list.map((e: string) => (e || '').trim()).filter(Boolean)) {
       const lc = raw.toLowerCase();
       const at = lc.indexOf('@');
       const domain = at >= 0 ? lc.slice(at + 1) : '';
@@ -2086,71 +2231,72 @@ app.post('/free-pool/assign', async (req, res) => {
     );
     if (Number(alreadyQ.rows[0]?.c || 0) >= 1) return res.status(400).json({ error: 'already_assigned_today' });
 
-    async function take(category: string, outcome: string, n: number) {
-      if (n <= 0) return [] as any[];
-      const q = await query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-        `SELECT id, email, domain, category, outcome 
-         FROM free_pool 
-         WHERE is_assigned=false AND category=$1 AND outcome=$2 
-         ORDER BY id ASC 
-         LIMIT $3`,
-        [category, outcome, n]
-      );
-      return q.rows;
-    }
+    let assignedCount = 0;
 
-    let rows: any[] = [];
-    if (sumReq === limit) {
-      const bizAcc = await take('business', 'accepted', rBizAcc);
-      const bizCat = await take('business', 'catch_all', rBizCat);
-      const perAcc = await take('personal', 'accepted', rPerAcc);
-      const perCat = await take('personal', 'catch_all', rPerCat);
-      if (bizAcc.length < rBizAcc || bizCat.length < rBizCat || perAcc.length < rPerAcc || perCat.length < rPerCat) {
-        return res.status(400).json({ error: 'not_enough_per_type', details: { bizAcc: bizAcc.length, bizCat: bizCat.length, perAcc: perAcc.length, perCat: perCat.length } });
+    await withTransaction(async (client) => {
+      async function take(category: string, outcome: string, n: number) {
+        if (n <= 0) return [] as any[];
+        const r = await client.query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
+          `SELECT id, email, domain, category, outcome
+           FROM free_pool
+           WHERE is_assigned=false AND category=$1 AND outcome=$2
+           ORDER BY id ASC
+           LIMIT $3
+           FOR UPDATE SKIP LOCKED`,
+          [category, outcome, n]
+        );
+        return r.rows;
       }
-      rows = [...bizAcc, ...bizCat, ...perAcc, ...perCat];
-    } else {
-      // Fallback: prefer ONLY 'accepted' unless not enough exist. 
-      // If the user wants catch-all, they should specify it in the 'request' object.
-      const anyQ = await query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-        `SELECT id, email, domain, category, outcome
-         FROM free_pool
-         WHERE is_assigned=false AND outcome = 'accepted'
-         ORDER BY id ASC
-         LIMIT $1`,
-        [limit]
-      );
-      rows = anyQ.rows;
 
-      // If we don't have enough 'accepted', we don't pull catch_all automatically 
-      // to keep data "clean" as requested by the user.
-    }
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: 'no_available_accepted_emails_in_free_pool' });
-    }
-    if (rows.length < limit) return res.status(400).json({ error: 'not_enough_free_pool', available: rows.length, required: limit });
-
-    const ids = rows.map(r => r.id);
-    await query('BEGIN');
-    await query('UPDATE free_pool SET is_assigned=true, assigned_to_uuid=$2, assigned_at=now() WHERE id = ANY($1::bigint[])', [ids, employeeId]);
-    for (const r of rows) {
-      // Trim email to prevent %20 issues in UI
-      const email = String(r.email || '').trim();
-      const domain = r.domain || null;
-      const outcome = ['accepted','catch_all','rejected','timeout'].includes(String(r.outcome || '')) ? String(r.outcome) : 'accepted';
-      if (String(r.category || '') === 'personal') {
-        await query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
+      let rows: any[] = [];
+      if (sumReq === limit) {
+        const bizAcc = await take('business', 'accepted', rBizAcc);
+        const bizCat = await take('business', 'catch_all', rBizCat);
+        const perAcc = await take('personal', 'accepted', rPerAcc);
+        const perCat = await take('personal', 'catch_all', rPerCat);
+        if (bizAcc.length < rBizAcc || bizCat.length < rBizCat || perAcc.length < rPerAcc || perCat.length < rPerCat) {
+          throw Object.assign(new Error('not_enough_per_type'), { details: { bizAcc: bizAcc.length, bizCat: bizCat.length, perAcc: perAcc.length, perCat: perCat.length }, status: 400 });
+        }
+        rows = [...bizAcc, ...bizCat, ...perAcc, ...perCat];
       } else {
-        await query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
+        // Fallback: prefer ONLY 'accepted' unless not enough exist.
+        // If the user wants catch-all, they should specify it in the 'request' object.
+        const anyQ = await client.query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
+          `SELECT id, email, domain, category, outcome
+           FROM free_pool
+           WHERE is_assigned=false AND outcome = 'accepted'
+           ORDER BY id ASC
+           LIMIT $1
+           FOR UPDATE SKIP LOCKED`,
+          [limit]
+        );
+        rows = anyQ.rows;
       }
-    }
-    await query('INSERT INTO free_pool_assignments(employee_uuid, business_accepted, business_catch_all, personal_accepted, personal_catch_all, total) VALUES ($1, $2, $3, $4, $5, $6)', [employeeId, rBizAcc, rBizCat, rPerAcc, rPerCat, limit]);
-    await query('COMMIT');
-    await publish(CHANNELS.batchProgress, { stage: 'free_pool_assigned', count: ids.length });
-    res.json({ assigned: ids.length });
+
+      if (rows.length === 0) throw Object.assign(new Error('no_available_accepted_emails_in_free_pool'), { status: 404 });
+      if (rows.length < limit) throw Object.assign(new Error('not_enough_free_pool'), { available: rows.length, required: limit, status: 400 });
+
+      const ids = rows.map(r => r.id);
+      await client.query('UPDATE free_pool SET is_assigned=true, assigned_to_uuid=$2, assigned_at=now() WHERE id = ANY($1::bigint[])', [ids, employeeId]);
+      for (const r of rows) {
+        const email = String(r.email || '').trim();
+        const domain = r.domain || null;
+        const outcome = ['accepted','catch_all','rejected','timeout'].includes(String(r.outcome || '')) ? String(r.outcome) : 'accepted';
+        if (String(r.category || '') === 'personal') {
+          await client.query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
+        } else {
+          await client.query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
+        }
+      }
+      await client.query('INSERT INTO free_pool_assignments(employee_uuid, business_accepted, business_catch_all, personal_accepted, personal_catch_all, total) VALUES ($1, $2, $3, $4, $5, $6)', [employeeId, rBizAcc, rBizCat, rPerAcc, rPerCat, limit]);
+      assignedCount = ids.length;
+    });
+
+    await publish(CHANNELS.batchProgress, { stage: 'free_pool_assigned', count: assignedCount });
+    res.json({ assigned: assignedCount });
   } catch (err: any) {
-    try { await query('ROLLBACK'); } catch {}
+    if (err.status === 404) return res.status(404).json({ error: err.message });
+    if (err.status === 400) return res.status(400).json({ error: err.message, ...(err.details ? { details: err.details } : {}), ...(err.available != null ? { available: err.available, required: err.required } : {}) });
     res.status(500).json({ error: 'free_pool_assign_failed', details: err.message });
   }
 });
@@ -2175,7 +2321,8 @@ app.get('/free-pool/assignments', async (req, res) => {
 });
 
 // Free pool assignment history (Global/All Employees)
-app.get('/collection/free-pool/history', async (_req, res) => {
+app.get('/collection/free-pool/history', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const rows = await query(
       `SELECT fpa.*, p.full_name, p.email
@@ -2191,7 +2338,8 @@ app.get('/collection/free-pool/history', async (_req, res) => {
 });
 
 // Admin free pool settings
-app.get('/admin/free-pool/settings', async (_req, res) => {
+app.get('/admin/free-pool/settings', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const settings = await query<{ daily_free_pool_limit: number }>('SELECT daily_free_pool_limit FROM system_settings ORDER BY updated_at DESC LIMIT 1');
     res.json({ daily_free_pool_limit: Number(settings.rows[0]?.daily_free_pool_limit || 200) });
@@ -2201,10 +2349,16 @@ app.get('/admin/free-pool/settings', async (_req, res) => {
 });
 
 app.post('/admin/free-pool/settings/update', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const limit = Number((req.body?.daily_free_pool_limit || 0));
     if (!Number.isFinite(limit) || limit <= 0) return res.status(400).json({ error: 'invalid_limit' });
-    await query('INSERT INTO system_settings(daily_free_pool_limit) VALUES ($1)', [limit]);
+    await withTransaction(async (client) => {
+      const updated = await client.query('UPDATE system_settings SET daily_free_pool_limit=$1, updated_at=now()', [limit]);
+      if ((updated.rowCount ?? 0) === 0) {
+        await client.query('INSERT INTO system_settings(daily_free_pool_limit) VALUES ($1)', [limit]);
+      }
+    });
     res.json({ ok: true, daily_free_pool_limit: limit });
   } catch (err: any) {
     res.status(500).json({ error: 'free_pool_settings_update_failed', details: err.message });
@@ -2213,7 +2367,8 @@ app.post('/admin/free-pool/settings/update', async (req, res) => {
 app.listen(config.apiPort, () => {
   console.log(`API listening on port ${config.apiPort}`);
 });
-app.get('/admin/keys', async (_req, res) => {
+app.get('/admin/keys', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const rows = await query('SELECT id, key, status, last_used_at, total_requests, total_success, total_failed, consecutive_errors FROM ninja_keys ORDER BY id');
     res.json(rows.rows);
@@ -2222,7 +2377,8 @@ app.get('/admin/keys', async (_req, res) => {
   }
 });
 
-app.post('/admin/keys/refresh', async (_req, res) => {
+app.post('/admin/keys/refresh', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const keys = (process.env.NINJA_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
     for (const k of keys) {
@@ -2235,13 +2391,19 @@ app.post('/admin/keys/refresh', async (_req, res) => {
   }
 });
 
-app.post('/admin/keys/recount', async (_req, res) => {
+app.post('/admin/keys/recount', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
-    const totals = await query<{ key: string; c: string }>(
-      `SELECT ninja_key_used AS key, COUNT(*) AS c FROM validation_results WHERE ninja_key_used IS NOT NULL GROUP BY ninja_key_used`
+    const totals = await query<{ key: string; total: string; success: string }>(
+      `SELECT ninja_key_used AS key,
+              COUNT(*) AS total,
+              COUNT(*) FILTER (WHERE outcome NOT IN ('timeout') AND status_enum NOT IN ('unknown')) AS success
+       FROM validation_results
+       WHERE ninja_key_used IS NOT NULL
+       GROUP BY ninja_key_used`
     );
     for (const r of totals.rows) {
-      await query('UPDATE ninja_keys SET total_requests=$2, total_success=$2 WHERE key=$1', [r.key, Number(r.c || 0)]);
+      await query('UPDATE ninja_keys SET total_requests=$2, total_success=$3 WHERE key=$1', [r.key, Number(r.total || 0), Number(r.success || 0)]);
     }
     res.json({ ok: true, updated: totals.rowCount });
   } catch (err: any) {
@@ -2250,9 +2412,13 @@ app.post('/admin/keys/recount', async (_req, res) => {
 });
 
 app.post('/admin/keys/:id/activate', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const id = Number(req.params.id);
     await query('UPDATE ninja_keys SET status=$2 WHERE id=$1', [id, 'active']);
+    // Invalidate cached key status so workers pick up the change within seconds
+    const kRow = await query<{ key: string }>('SELECT key FROM ninja_keys WHERE id=$1', [id]);
+    if (kRow.rows[0]?.key) await redis.del(`ninja:key_status:${kRow.rows[0].key}`);
     res.json({ ok: true });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_key_activate_failed', details: err.message });
@@ -2260,18 +2426,28 @@ app.post('/admin/keys/:id/activate', async (req, res) => {
 });
 
 app.post('/admin/keys/:id/deactivate', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const id = Number(req.params.id);
     await query('UPDATE ninja_keys SET status=$2 WHERE id=$1', [id, 'disabled']);
+    const kRow = await query<{ key: string }>('SELECT key FROM ninja_keys WHERE id=$1', [id]);
+    if (kRow.rows[0]?.key) await redis.del(`ninja:key_status:${kRow.rows[0].key}`);
     res.json({ ok: true });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_key_deactivate_failed', details: err.message });
   }
 });
 
-app.get('/admin/workers', async (_req, res) => {
+app.get('/admin/workers', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
-    const keys = await redis.keys('worker:*:status');
+    const keys: string[] = [];
+    let cursor = '0';
+    do {
+      const [next, batch] = await redis.scan(cursor, 'MATCH', 'worker:*:status', 'COUNT', '100');
+      cursor = next;
+      keys.push(...batch);
+    } while (cursor !== '0');
     const items = [] as any[];
     for (const k of keys) items.push(await redis.hgetall(k));
     res.json(items);
@@ -2280,10 +2456,12 @@ app.get('/admin/workers', async (_req, res) => {
   }
 });
 
-app.get('/admin/system/stats', async (_req, res) => {
+app.get('/admin/system/stats', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const activeKeys = await query<{ c: string }>('SELECT COUNT(*) AS c FROM ninja_keys WHERE status=$1', ['active']);
-    const totalWorkers = (await redis.keys('worker:*:status')).length;
+    let totalWorkers = 0;
+    { let cur = '0'; do { const [next, batch] = await redis.scan(cur, 'MATCH', 'worker:*:status', 'COUNT', '100'); cur = next; totalWorkers += batch.length; } while (cur !== '0'); }
     const activeBatchesQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM batches WHERE status IN ($1,$2)', ['created', 'running']);
     const todayValidationsQ = await query<{ c: string }>(`SELECT COUNT(*) AS c FROM validation_results WHERE validated_at::date = CURRENT_DATE`);
     const rtSum = Number(await redis.get('val_speed_sum') || '0');
@@ -2295,7 +2473,8 @@ app.get('/admin/system/stats', async (_req, res) => {
   }
 });
 
-app.get('/admin/system/speed', async (_req, res) => {
+app.get('/admin/system/speed', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const points = await redis.lrange('val_speed_points', 0, 2000);
     const now = Date.now();
@@ -2319,7 +2498,8 @@ app.get('/admin/system/speed', async (_req, res) => {
   }
 });
 
-app.get('/admin/system/watcher', async (_req, res) => {
+app.get('/admin/system/watcher', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const lastRun = await redis.get('queue_watcher:last_run');
     const historyRaw = await redis.lrange('queue_watcher:history', 0, 10);
@@ -2333,7 +2513,7 @@ app.get('/admin/system/watcher', async (_req, res) => {
 });
 
 app.post('/admin/validation/rebalance', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
   try {
     const batchId = Number((req.body?.batch_id || 0));
     if (!batchId) return res.status(400).json({ error: 'missing_batch_id' });
@@ -2353,7 +2533,7 @@ app.post('/admin/validation/rebalance', async (req, res) => {
         const toIdx = await assignWorkerRoundRobin(batchId);
         const destQ = queues[toIdx] || queues[0];
         if (destQ) {
-          await destQ.add('validateEmail', { masterId: mid }, { removeOnComplete: true, removeOnFail: true });
+          await destQ.add('validateEmail', { masterId: mid }, { jobId: `val-${mid}`, removeOnComplete: true, removeOnFail: true });
           moved++;
         }
       }
@@ -2366,7 +2546,8 @@ app.post('/admin/validation/rebalance', async (req, res) => {
 });
 
 // Admin: queue stats (waiting, active, delayed, completed, failed)
-app.get('/admin/queues/stats', async (_req, res) => {
+app.get('/admin/queues/stats', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const list: { name: string; q: any }[] = [
       { name: QUEUE_NAMES.dedupe, q: dedupeQueue },
@@ -2397,7 +2578,7 @@ app.get('/admin/queues/stats', async (_req, res) => {
 
 // Enqueue pending validation jobs (useful when a new batch appears not validating yet)
 app.post('/admin/validation/enqueue', async (req, res) => {
-  if (!requireAdmin(req, res)) return;
+  if (!await requireAdmin(req, res)) return;
   try {
     const batchId = Number((req.body?.batch_id || 0));
     const rows = await query<{ id: number }>(
@@ -2413,28 +2594,28 @@ app.post('/admin/validation/enqueue', async (req, res) => {
       batchId ? [batchId] : []
     );
     let enq = 0;
+    let failed = 0;
     for (const r of rows.rows) {
       try {
         const m = await query<{ batch_id: number }>('SELECT batch_id FROM master_emails WHERE id=$1', [r.id]);
         const bid = Number(m.rows[0]?.batch_id || 0);
-        if (bid) {
-          const va = await import('../utils/validationAssignment')
-          await va.ensureBatchActivated(bid)
-        }
-        const idx = bid ? await (await import('../utils/validationAssignment')).assignWorkerRoundRobin(bid) : 0;
-        const queuesMod = await import('../queues');
-        const qArr = (queuesMod as any).validationQueues as any[];
-        const q = qArr[idx] || qArr[0];
-        await q.add('validateEmail', { masterId: r.id }, { jobId: String(r.id), removeOnComplete: true, removeOnFail: true });
+        if (bid) await ensureBatchActivated(bid);
+        const idx = bid ? await assignWorkerRoundRobin(bid) : 0;
+        const q = validationQueues[idx] || validationQueues[0];
+        await q.add('validateEmail', { masterId: r.id }, { jobId: `val-${r.id}`, removeOnComplete: true, removeOnFail: true });
         enq++;
-      } catch {}
+      } catch (e: any) {
+        failed++;
+        console.error(`[admin/validation/enqueue] Failed to enqueue masterId=${r.id}:`, e?.message || e);
+      }
     }
-    res.json({ enqueued: enq, batch_id: batchId || null });
+    res.json({ enqueued: enq, failed, batch_id: batchId || null });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_validation_enqueue_failed', details: err.message });
   }
 });
-app.get('/admin/validation/pending', async (_req, res) => {
+app.get('/admin/validation/pending', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
   try {
     const rows = await query(
       `SELECT me.batch_id, COUNT(*) AS c
@@ -2476,31 +2657,30 @@ app.delete('/batches/:id', async (req, res) => {
       await removeJobs(vq, ['waiting','delayed'], (j) => masterIds.has(Number(j?.data?.masterId)));
     }
 
-    await query('UPDATE batches SET status=$2 WHERE batch_id=$1', [id, 'deleted']);
+    await withTransaction(async (client) => {
+      await client.query('UPDATE batches SET status=$2 WHERE batch_id=$1', [id, 'deleted']);
+      await client.query('DELETE FROM validation_results WHERE master_id IN (SELECT id FROM master_emails WHERE batch_id=$1)', [id]);
+      await client.query('DELETE FROM filtered_emails WHERE batch_id=$1', [id]);
+      await client.query('DELETE FROM personal_emails WHERE master_id IN (SELECT id FROM master_emails WHERE batch_id=$1)', [id]);
+      await client.query('DELETE FROM final_business_emails WHERE batch_id=$1', [id]);
+      await client.query('DELETE FROM final_personal_emails WHERE batch_id=$1', [id]);
+      await client.query('DELETE FROM free_pool WHERE batch_id=$1', [id]);
+      await client.query('DELETE FROM free_pool_assignments WHERE employee_uuid IN (SELECT DISTINCT assigned_to_uuid FROM free_pool WHERE batch_id=$1)', [id]);
+      await client.query('DELETE FROM master_emails_temp WHERE batch_id=$1', [id]);
+      await client.query('DELETE FROM master_emails WHERE batch_id=$1', [id]);
+      await client.query('DELETE FROM batches WHERE batch_id=$1', [id]);
+      await client.query('INSERT INTO audit_logs(action_type, actor_id, resource_ref, details) VALUES ($1, $2, $3, $4)', ['batch_deleted', 0, String(id), JSON.stringify({ deleted_by: actorUuid })]);
+    });
 
-    await query('BEGIN');
-    await query('DELETE FROM validation_results WHERE master_id IN (SELECT id FROM master_emails WHERE batch_id=$1)', [id]);
-    await query('DELETE FROM filtered_emails WHERE batch_id=$1', [id]);
-    await query('DELETE FROM filter_emails WHERE master_id IN (SELECT id FROM master_emails WHERE batch_id=$1)', [id]);
-    await query('DELETE FROM personal_emails WHERE master_id IN (SELECT id FROM master_emails WHERE batch_id=$1)', [id]);
-    await query('DELETE FROM final_business_emails WHERE batch_id=$1', [id]);
-    await query('DELETE FROM final_personal_emails WHERE batch_id=$1', [id]);
-    await query('DELETE FROM free_pool WHERE batch_id=$1', [id]);
-    await query('DELETE FROM free_pool_assignments WHERE employee_uuid IN (SELECT DISTINCT assigned_to_uuid FROM free_pool WHERE batch_id=$1)', [id]);
-    await query('DELETE FROM master_emails_temp WHERE batch_id=$1', [id]);
-    await query('DELETE FROM master_emails WHERE batch_id=$1', [id]);
-    await query('DELETE FROM batches WHERE batch_id=$1', [id]);
-    await query('COMMIT');
-
+    await releaseBatchAssignment(id);
+    // Evict cached counts so subsequent reads don't return stale data for the deleted batch
+    await redis.del(`batch:counts:${id}`);
+    // Reset the bloom filter — deleted emails should be re-submittable; the filter rebuilds
+    // naturally as future batches are processed through the dedupe worker
+    await redis.del(config.bloomKey);
     await publish(CHANNELS.batchProgress, { type: 'batch_deleted', batchId: id });
-    try {
-      const { releaseBatchAssignment } = await import('../utils/validationAssignment');
-      await releaseBatchAssignment(id);
-    } catch {}
-    await query('INSERT INTO audit_logs(action_type, actor_id, resource_ref, details) VALUES ($1, $2, $3, $4)', ['batch_deleted', 0, String(id), JSON.stringify({ deleted_by: actorUuid })]);
     res.json({ success: true, message: 'Batch deleted', batch_id: id });
   } catch (err: any) {
-    try { await query('ROLLBACK'); } catch {}
     res.status(500).json({ error: 'batch_delete_failed', details: err.message });
   }
 });

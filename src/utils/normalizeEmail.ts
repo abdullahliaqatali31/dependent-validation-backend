@@ -1,7 +1,9 @@
 export type NormalizationStrategy = 'none' | 'gmail_dot_strip' | 'plus_tag_strip' | 'gmail_full';
 
 export function normalizeEmail(raw: string, strategy: NormalizationStrategy = 'none') {
-  const trimmed = raw.trim().toLowerCase();
+  let decoded = (raw || '').trim();
+  try { decoded = decodeURIComponent(decoded); } catch { /* malformed encoding — leave as-is */ }
+  const trimmed = decoded.trim().toLowerCase();
   const [local, domain] = trimmed.split('@');
   if (!domain || !local) return { normalized: trimmed, local, domain, strategy: 'none' as NormalizationStrategy };
 

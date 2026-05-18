@@ -39,7 +39,7 @@ async function processBatch(batchId: number) {
     if (staged.rows.length === 0) break;
 
     for (const row of staged.rows) {
-      const n = normalizeEmail(row.email_raw, 'none');
+      const n = normalizeEmail(row.email_raw, 'gmail_full');
       let insertedId: number | null = null;
       const ins = await query<{ id: number }>(
         'INSERT INTO master_emails(email_normalized, email_raw, domain, local_part, batch_id, dedupe_status, submitter_id, submitter_team_id, submitter_uuid) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (email_normalized) DO NOTHING RETURNING id',
