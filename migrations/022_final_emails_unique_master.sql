@@ -1,16 +1,17 @@
--- Remove duplicate rows (keep the lowest id per master_id) before adding constraint
-DELETE FROM final_business_emails
-WHERE id NOT IN (
-  SELECT MIN(id) FROM final_business_emails GROUP BY master_id
-);
+-- Step 1: Create plain indexes first so the dedup DELETE can use them (critical on large tables)
+CREATE INDEX IF NOT EXISTS idx_fbe_master_id_dedup ON final_business_emails(master_id);
+CREATE INDEX IF NOT EXISTS idx_fpe_master_id_dedup ON final_personal_emails(master_id);
 
-DELETE FROM final_personal_emails
-WHERE id NOT IN (
-  SELECT MIN(id) FROM final_personal_emails GROUP BY master_id
-);
+-- Step 2: Remove duplicate rows using a self-join (fast with the index above)
+DELETE FROM final_business_emails a
+USING final_business_emails b
+WHERE a.master_id = b.master_id AND a.id > b.id;
 
--- Unique constraint: each master email can only appear once in each final table
--- Wrapped in idempotent DO blocks so re-running the migration does not crash
+DELETE FROM final_personal_emails a
+USING final_personal_emails b
+WHERE a.master_id = b.master_id AND a.id > b.id;
+
+-- Step 3: Add unique constraints (idempotent — safe to re-run)
 DO $$
 BEGIN
   IF NOT EXISTS (
@@ -31,6 +32,6 @@ BEGIN
   END IF;
 END $$;
 
--- Index to speed up the queueWatcher stuck-split query
-CREATE INDEX IF NOT EXISTS idx_final_business_master ON final_business_emails(master_id);
-CREATE INDEX IF NOT EXISTS idx_final_personal_master ON final_personal_emails(master_id);
+-- Step 4: Drop the plain dedup indexes — the UNIQUE constraints above replaced them with unique indexes
+DROP INDEX IF EXISTS idx_fbe_master_id_dedup;
+DROP INDEX IF EXISTS idx_fpe_master_id_dedup;
