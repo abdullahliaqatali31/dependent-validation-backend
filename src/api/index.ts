@@ -927,6 +927,48 @@ app.get('/employee/overview', async (req, res) => {
   }
 });
 
+// Employee: list own batches with pagination
+app.get('/employee/batches', async (req, res) => {
+  try {
+    const employeeId = String((req.query.employee_id || '').toString());
+    if (!employeeId) return res.status(400).json({ error: 'missing_employee_id' });
+
+    const limit = Number(req.query.limit || 20);
+    const offset = Number(req.query.offset || 0);
+    const status = req.query.status ? String(req.query.status) : null;
+
+    const isUuid = employeeId.includes('-');
+    let queryStr = 'SELECT * FROM batches WHERE ' + (isUuid ? 'submitter_uuid = $1' : 'submitter_id = $1');
+    const params: any[] = [isUuid ? employeeId : Number(employeeId)];
+
+    if (status) {
+      params.push(status);
+      queryStr += ` AND status = $${params.length}`;
+    }
+
+    queryStr += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+    const countRes = await query(
+      'SELECT COUNT(*)::text FROM batches WHERE ' + (isUuid ? 'submitter_uuid = $1' : 'submitter_id = $1') + (status ? ' AND status = $2' : ''),
+      status ? [isUuid ? employeeId : Number(employeeId), status] : [isUuid ? employeeId : Number(employeeId)]
+    );
+    const totalCount = Number(countRes.rows[0]?.count || 0);
+
+    const batches = await query(queryStr, [...params, limit, offset]);
+
+    const result = [];
+    for (const b of batches.rows as any[]) {
+      const counts = await getBatchCounts(b.batch_id);
+      result.push({ batch: b, counts });
+    }
+
+    res.json({ batches: result, total: totalCount, limit, offset });
+  } catch (err: any) {
+    console.error(err);
+    res.status(500).json({ error: 'employee_batches_failed', details: err.message });
+  }
+});
+
 app.get('/employee/validation-summary', async (req, res) => {
   try {
     const employeeId = String((req.query.employee_id || '').toString());
