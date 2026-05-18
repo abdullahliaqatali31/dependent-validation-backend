@@ -57,19 +57,23 @@ async function getVerifiedUser(req: express.Request): Promise<{ id?: string; rol
     try {
       const { data: { user }, error } = await supabaseAdmin.auth.getUser(token);
       if (error || !user) return null;
-      const am = (user.app_metadata as any) || {};
-      const um = (user.user_metadata as any) || {};
+      // Always prioritize the database profiles table for the authoritative user role
       let role: string | undefined;
-      if (typeof am.role === 'string') role = am.role;
-      else if (typeof um.role === 'string') role = um.role;
-      else if (Array.isArray(am.roles) && am.roles.some((r: any) => String(r).toLowerCase() === 'admin')) role = 'admin';
-      else if (am.is_admin === true || am.admin === true) role = 'admin';
+      try {
+        const p = await query<{ role: string | null }>('SELECT role FROM profiles WHERE id=$1', [user.id]);
+        if (p.rows[0]?.role) role = p.rows[0].role;
+      } catch {}
+
+      // Fallback to JWT metadata if not found in database profiles
       if (!role) {
-        try {
-          const p = await query<{ role: string | null }>('SELECT role FROM profiles WHERE id=$1', [user.id]);
-          if (p.rows[0]?.role) role = p.rows[0].role;
-        } catch {}
+        const am = (user.app_metadata as any) || {};
+        const um = (user.user_metadata as any) || {};
+        if (typeof am.role === 'string') role = am.role;
+        else if (typeof um.role === 'string') role = um.role;
+        else if (Array.isArray(am.roles) && am.roles.some((r: any) => String(r).toLowerCase() === 'admin')) role = 'admin';
+        else if (am.is_admin === true || am.admin === true) role = 'admin';
       }
+
       return { id: user.id, role };
     } catch {
       return null;
