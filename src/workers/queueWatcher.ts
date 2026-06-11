@@ -2,7 +2,7 @@
 import { query } from '../db';
 import { dedupeQueue, filterQueue, validationQueues, personalQueue } from '../queues';
 import { ensureBatchActivated, assignWorkerRoundRobin, releaseBatchAssignment } from '../utils/validationAssignment';
-import { redis } from '../redis';
+import { redis, publish, CHANNELS } from '../redis';
 import { syncProfiles } from '../utils/syncUtils';
 
 const CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -248,6 +248,37 @@ async function checkAndResume() {
         }
     }
     
+    // 5b. All-filtered-out batches (safety net for filterWorker.maybeCompleteAllFiltered):
+    // fully deduped + filtered, but every email was removed so nothing reached validation and the
+    // normal completion gate (which needs total>0) can never fire. Complete them so they don't hang.
+    const allFilteredOut = await query<{ batch_id: number }>(
+        `SELECT b.batch_id
+         FROM batches b
+         WHERE b.status NOT IN ('completed','cancelled','duplicate','paused')
+           AND NOT EXISTS (SELECT 1 FROM master_emails_temp t WHERE t.batch_id = b.batch_id)
+           AND (SELECT COUNT(*) FROM master_emails me WHERE me.batch_id = b.batch_id) > 0
+           AND (SELECT COUNT(*) FROM master_emails me WHERE me.batch_id = b.batch_id)
+               <= (SELECT COUNT(*) FROM filtered_emails fe WHERE fe.batch_id = b.batch_id)
+           AND NOT EXISTS (
+                 SELECT 1 FROM filtered_emails fe
+                 WHERE fe.batch_id = b.batch_id AND fe.status NOT LIKE 'removed:%'
+               )
+         LIMIT 50`
+    );
+    for (const row of allFilteredOut.rows) {
+        const batchId = Number(row.batch_id);
+        const upd = await query(
+            `UPDATE batches SET status='completed', completed_at=NOW()
+             WHERE batch_id=$1 AND status NOT IN ('completed','cancelled','duplicate')`,
+            [batchId]
+        );
+        if ((upd.rowCount ?? 0) > 0) {
+            affectedBatches.add(batchId);
+            console.log(`[QueueWatcher] Batch ${batchId} completed: all emails filtered out (nothing to validate)`);
+            await publish(CHANNELS.batchProgress, { batchId, step: 'done', stage: 'completed', processed: 0, total: 0 });
+        }
+    }
+
     // 6. Idle System Check (Auto-complete stuck batches if 15 mins of no activity)
     let totalPendingJobs = 0;
     const queuesToCheck = [dedupeQueue, filterQueue, personalQueue, ...(validationQueues || [])];

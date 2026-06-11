@@ -4,7 +4,7 @@ import { config } from '../config'
 import { query } from '../db'
 import { redis, publish, CHANNELS } from '../redis'
 import { QUEUE_NAMES, personalQueue, validationQueues } from '../queues'
-import { releaseBatchAssignment, ensureBatchActivated, assignWorkerRoundRobin } from '../utils/validationAssignment'
+import { releaseBatchAssignment, ensureBatchActivated, assignWorkerRoundRobin, refreshActiveBatch } from '../utils/validationAssignment'
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
 
@@ -105,6 +105,8 @@ async function processJob(masterId: number, key: string, workerId: string, worke
   }
 
   await heartbeat(workerId, key, `${batchId}:${email}`)
+  // Keep the active-batch lock alive while this batch is genuinely being worked on.
+  await refreshActiveBatch(batchId).catch(() => {})
   try {
     const data = await verify(email, key)
     const code = String((data.code || '').toString()).toLowerCase()
@@ -163,14 +165,18 @@ async function processJob(masterId: number, key: string, workerId: string, worke
     // Use 'timeout' so the pre-check above allows a future retry (unlike 'rejected' which is final).
     // Retry the DB insert up to 3 times in case of a transient DB connection issue.
     const errDetails = JSON.stringify({ error: (e as any)?.message || String(e), ts: Date.now() })
+    // Don't blindly tag errored emails as 'business'. Use the domain heuristic (public provider =>
+    // personal) so personal addresses aren't miscategorized; personalWorker refines this downstream.
+    const errDomain = String(m.rows[0]?.domain || '').toLowerCase()
+    const errCategory = DEFAULT_PUBLIC_DOMAINS.has(errDomain) ? 'personal' : 'business'
     let recorded = false
     for (let attempt = 0; attempt < 3 && !recorded; attempt++) {
       try {
         await query(
           `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, outcome, category)
-           VALUES ($1, 'unknown', $2, $3, 'timeout', 'business')
+           VALUES ($1, 'unknown', $2, $3, 'timeout', $4)
            ON CONFLICT (master_id) DO NOTHING`,
-          [masterId, errDetails, key]
+          [masterId, errDetails, key, errCategory]
         )
         recorded = true
       } catch (dbErr) {

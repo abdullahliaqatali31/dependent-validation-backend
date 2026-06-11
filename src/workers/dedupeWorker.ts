@@ -76,7 +76,11 @@ async function processBatch(batchId: number) {
       return;
   }
 
-  await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'dedupe_complete', processed: masterCount, total: masterCount });
+  // Global dedup (intended): emails already present in master_emails from ANY past batch are
+  // dropped via ON CONFLICT. Surface how many were dropped so the count isn't silently lost.
+  const duplicates = Math.max(0, batchTotal - masterCount);
+  console.log(`[DedupeWorker] Batch ${batchId}: ${masterCount} new unique, ${duplicates} duplicates dropped (of ${batchTotal} submitted)`);
+  await publish(CHANNELS.batchProgress, { batchId, step: 'dedupe', stage: 'dedupe_complete', processed: masterCount, total: masterCount, unique: masterCount, duplicates, submitted: batchTotal });
 }
 
 export const dedupeWorker = new Worker(

@@ -8,14 +8,31 @@ const ACTIVE_BATCH_KEY = 'val:active_batch_id'
 const BATCH_ACTIVATED_KEY = (batchId: number) => `val:batch:${batchId}:activated`
 const BATCH_RR_KEY = (batchId: number) => `val:batch:${batchId}:rr`
 
+// TTL on the global active-batch lock so a process that dies mid-batch without calling
+// releaseBatchAssignment() can't leak the lock forever. The validation worker refreshes it on
+// every processed email (refreshActiveBatch), so it only expires when the batch is genuinely
+// stalled — at which point queueWatcher's force-complete is the intended recovery.
+const ACTIVE_LOCK_TTL_SEC = 1800
+
 export async function waitForBatchTurn(batchId: number): Promise<void> {
   while (true) {
     // Atomically claim the active slot — SET NX prevents two batches both seeing null and both claiming
-    const claimed = await redis.set(ACTIVE_BATCH_KEY, String(batchId), 'NX')
+    const claimed = await redis.set(ACTIVE_BATCH_KEY, String(batchId), 'EX', ACTIVE_LOCK_TTL_SEC, 'NX')
     if (claimed) return
     const active = await redis.get(ACTIVE_BATCH_KEY)
-    if (Number(active) === batchId) return
+    if (Number(active) === batchId) {
+      await redis.expire(ACTIVE_BATCH_KEY, ACTIVE_LOCK_TTL_SEC)
+      return
+    }
     await new Promise(r => setTimeout(r, 1000))
+  }
+}
+
+// Refresh the active-batch lock TTL while a batch is actively being validated.
+export async function refreshActiveBatch(batchId: number): Promise<void> {
+  const active = await redis.get(ACTIVE_BATCH_KEY)
+  if (active && Number(active) === batchId) {
+    await redis.expire(ACTIVE_BATCH_KEY, ACTIVE_LOCK_TTL_SEC)
   }
 }
 

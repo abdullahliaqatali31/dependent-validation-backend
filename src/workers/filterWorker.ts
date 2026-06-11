@@ -43,6 +43,36 @@ async function loadRulesFor(masterId: number) {
 
 const rulesCache: Map<string, { rules: { contains: string[]; endswith: string[]; domains: string[]; excludes: string[] }; expires: number }> = new Map();
 
+// When a batch is fully deduped + filtered and EVERY email was removed, no validation job is ever
+// enqueued, so the normal completion gate (in validationMulti, which needs total>0) never fires and
+// the batch hangs in 'processing' forever. Detect that terminal state here and complete the batch.
+async function maybeCompleteAllFiltered(batchId: number) {
+  const staging = await query<{ c: string }>('SELECT COUNT(*) AS c FROM master_emails_temp WHERE batch_id=$1', [batchId]);
+  if (Number(staging.rows[0]?.c || 0) > 0) return; // dedupe still feeding more emails
+  const counts = await query<{ master: string; filtered: string; kept: string }>(
+    `SELECT
+       (SELECT COUNT(*) FROM master_emails WHERE batch_id=$1) AS master,
+       (SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1) AS filtered,
+       (SELECT COUNT(*) FROM filtered_emails WHERE batch_id=$1 AND status NOT LIKE 'removed:%') AS kept`,
+    [batchId]
+  );
+  const master = Number(counts.rows[0]?.master || 0);
+  const filtered = Number(counts.rows[0]?.filtered || 0);
+  const kept = Number(counts.rows[0]?.kept || 0);
+  // Only complete once every master row has been filtered (filtered>=master) and none survived (kept===0).
+  if (master > 0 && filtered >= master && kept === 0) {
+    const upd = await query(
+      `UPDATE batches SET status='completed', completed_at=NOW()
+       WHERE batch_id=$1 AND status NOT IN ('completed','cancelled','duplicate')`,
+      [batchId]
+    );
+    if ((upd.rowCount ?? 0) > 0) {
+      console.log(`[FilterWorker] Batch ${batchId} completed: all ${master} emails filtered out (nothing to validate)`);
+      await publish(CHANNELS.batchProgress, { batchId, step: 'done', stage: 'completed', processed: 0, total: 0 });
+    }
+  }
+}
+
 // Evict stale entries every 5 minutes to prevent unbounded growth on long-running workers
 setInterval(() => {
   const now = Date.now();
@@ -94,7 +124,11 @@ async function processMaster(masterId: number) {
     await publish(CHANNELS.batchProgress, { batchId, step: 'filter', stage: 'filter', processed, total });
   } catch {}
   await publish(CHANNELS.batchProgress, { stage: 'filter', status: removed ? 'excluded' : 'passed', master_id: masterId });
-  if (removed) return;
+  if (removed) {
+    // Nothing to validate for this email — check whether the whole batch filtered out to nothing.
+    try { await maybeCompleteAllFiltered(batchId); } catch (e) { console.error('[FilterWorker] completion check failed', e); }
+    return;
+  }
 
   // If another batch holds the validation lock, queue with delay instead of discarding
   const activeBatchId = await redis.get('val:active_batch_id');

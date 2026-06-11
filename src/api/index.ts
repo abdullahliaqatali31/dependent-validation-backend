@@ -38,6 +38,46 @@ app.use(cors({
 app.options('*', cors());
 app.use(express.json({ limit: '10mb' }));
 
+// --- Lightweight in-memory rate limiting (no external dependency) ---
+// Backstop against trivial abuse/DoS: /upload spawns a full pipeline and the export endpoints
+// write CSVs to disk. Sufficient for a single API instance; move to a Redis-backed limiter if
+// you run multiple API instances behind a load balancer.
+type RlBucket = { count: number; resetAt: number };
+const rlStore = new Map<string, RlBucket>();
+function rateLimit(opts: { windowMs: number; max: number; key: string }) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const fwd = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim();
+    const ip = fwd || req.socket.remoteAddress || 'unknown';
+    const bucketKey = `${opts.key}:${ip}`;
+    const now = Date.now();
+    let b = rlStore.get(bucketKey);
+    if (!b || b.resetAt <= now) { b = { count: 0, resetAt: now + opts.windowMs }; rlStore.set(bucketKey, b); }
+    b.count++;
+    if (b.count > opts.max) {
+      const retry = Math.ceil((b.resetAt - now) / 1000);
+      res.setHeader('Retry-After', String(retry));
+      return res.status(429).json({ error: 'rate_limited', retry_after_seconds: retry });
+    }
+    return next();
+  };
+}
+const uploadLimiter = rateLimit({ windowMs: 60_000, max: 20, key: 'upload' });
+const exportLimiter = rateLimit({ windowMs: 60_000, max: 30, key: 'export' });
+const globalLimiter = rateLimit({ windowMs: 60_000, max: 1000, key: 'global' });
+app.use((req, res, next) => {
+  if (req.method === 'POST' && req.path === '/upload') return uploadLimiter(req, res, next);
+  // Only the heavy export / file-download endpoints (disk writes), not the polled history list
+  // (/download-history) or the /mark-downloaded mutation.
+  if (/(\/export|\/download\/|\/download-history\/file)/i.test(req.path)) return exportLimiter(req, res, next);
+  return globalLimiter(req, res, next);
+});
+// Evict stale buckets so the Map can't grow unbounded.
+const rlSweep = setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rlStore) if (v.resetAt <= now) rlStore.delete(k);
+}, 60_000);
+rlSweep.unref?.();
+
 // Supabase Admin client for server-side user management
 const supabaseAdmin = (config.supabaseUrl && config.supabaseServiceRoleKey)
   ? createClient(config.supabaseUrl, config.supabaseServiceRoleKey)
@@ -2225,14 +2265,21 @@ app.get('/free-pool/summary', async (req, res) => {
     const limit = Number(settings.rows[0]?.daily_free_pool_limit || 200);
     const availableQ = await query<{ c: string }>('SELECT COUNT(*) AS c FROM free_pool WHERE is_assigned=false');
     let assignedToday = 0;
+    let outstanding = 0;
     if (employeeId) {
       const assignedTodayQ = await query<{ c: string }>(
         `SELECT COUNT(*) AS c FROM free_pool WHERE assigned_to_uuid=$1 AND is_assigned=true AND assigned_at::date = CURRENT_DATE`,
         [employeeId]
       );
       assignedToday = Number(assignedTodayQ.rows[0]?.c || 0);
+      const outstandingQ = await query<{ c: string }>(
+        `SELECT COUNT(*) AS c FROM free_pool
+         WHERE assigned_to_uuid=$1 AND is_assigned=true AND COALESCE(is_downloaded,false)=false`,
+        [employeeId]
+      );
+      outstanding = Number(outstandingQ.rows[0]?.c || 0);
     }
-    res.json({ limit, available: Number(availableQ.rows[0]?.c || 0), assigned_today: assignedToday });
+    res.json({ limit, available: Number(availableQ.rows[0]?.c || 0), assigned_today: assignedToday, outstanding });
   } catch (err: any) {
     res.status(500).json({ error: 'free_pool_summary_failed', details: err.message });
   }
@@ -2271,15 +2318,33 @@ app.post('/free-pool/assign', async (req, res) => {
     const rPerCat = Number(requested.personal_catch_all || 0);
     const sumReq = rBizAcc + rBizCat + rPerAcc + rPerCat;
     if (sumReq > 0 && sumReq !== limit) return res.status(400).json({ error: 'request_must_equal_limit', limit, requested: sumReq });
-    const alreadyQ = await query<{ c: string }>(
-      `SELECT COUNT(*) AS c FROM free_pool WHERE assigned_to_uuid=$1 AND is_assigned=true AND assigned_at::date = CURRENT_DATE`,
+    // Enforce the limit on OUTSTANDING (assigned-but-not-yet-downloaded) holdings, not on
+    // "claimed today". The old per-day check reset at midnight, so holdings grew without bound
+    // (e.g. 500/day for ~22 days = 11k). Each claim grants exactly `limit` rows, so we only allow
+    // a new claim when the employee has fully downloaded their current batch (outstanding == 0);
+    // that caps what they can hold at exactly `limit` (blocking at >= limit would still let a
+    // partially-downloaded employee top up to ~2x).
+    const outstandingQ = await query<{ c: string }>(
+      `SELECT COUNT(*) AS c FROM free_pool
+       WHERE assigned_to_uuid=$1 AND is_assigned=true AND COALESCE(is_downloaded,false)=false`,
       [employeeId]
     );
-    if (Number(alreadyQ.rows[0]?.c || 0) >= 1) return res.status(400).json({ error: 'already_assigned_today' });
+    if (Number(outstandingQ.rows[0]?.c || 0) > 0) {
+      return res.status(400).json({ error: 'limit_reached', limit, outstanding: Number(outstandingQ.rows[0]?.c || 0) });
+    }
 
     let assignedCount = 0;
 
     await withTransaction(async (client) => {
+      // Re-check inside the transaction to close the double-submit / concurrent-claim race.
+      const outstandingTx = await client.query<{ c: string }>(
+        `SELECT COUNT(*) AS c FROM free_pool
+         WHERE assigned_to_uuid=$1 AND is_assigned=true AND COALESCE(is_downloaded,false)=false`,
+        [employeeId]
+      );
+      if (Number(outstandingTx.rows[0]?.c || 0) > 0) {
+        throw Object.assign(new Error('limit_reached'), { status: 400 });
+      }
       async function take(category: string, outcome: string, n: number) {
         if (n <= 0) return [] as any[];
         const r = await client.query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
