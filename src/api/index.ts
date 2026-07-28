@@ -9,6 +9,12 @@ import { ensureBatchActivated, assignWorkerRoundRobin, releaseBatchAssignment } 
 import { EMAIL_PROVIDERS } from '../utils/emailProvider';
 import { createClient } from '@supabase/supabase-js';
 
+// Rows written before the provider backfill have provider IS NULL, and the summary endpoints count
+// those as 'unknown'. Filtering must agree, or the Unknown bucket shows a count with an empty table.
+function providerSql(col: string, idx: number, provider: string) {
+  return provider === 'unknown' ? `(${col} = $${idx} OR ${col} IS NULL)` : `${col} = $${idx}`;
+}
+
 const app = express();
 // CORS: allow frontend dev origins and necessary headers/methods
 const allowedOrigins = [
@@ -444,7 +450,7 @@ app.get('/employee/results/by-category', async (req, res) => {
              FROM validation_results vr
              JOIN master_emails me ON vr.master_id=me.id
              WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.batch_id=$3
-             ${provider ? 'AND vr.provider=$4' : ''}
+             ${provider ? `AND ${providerSql('vr.provider', 4, provider)}` : ''}
              ORDER BY vr.validated_at DESC LIMIT 2000`;
       params.push(Number(batchId));
       if (provider) params.push(provider);
@@ -460,14 +466,14 @@ app.get('/employee/results/by-category', async (req, res) => {
              WHERE b.submitter_uuid = $1
                AND f.outcome = $2
                AND COALESCE(f.is_free_pool, false) = false
-               ${provider ? 'AND f.provider = $3' : ''}
+               ${provider ? `AND ${providerSql('f.provider', 3, provider)}` : ''}
              ORDER BY f.id DESC LIMIT 2000`;
       params = provider ? [employeeId, outcome, provider] : [employeeId, outcome];
     } else if (source === 'free_pool') {
       sql = `SELECT email, NULL AS reason, NULL AS key
              FROM free_pool
              WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true AND COALESCE(is_downloaded,false)=false
-             ${provider ? 'AND provider=$4' : ''}
+             ${provider ? `AND ${providerSql('provider', 4, provider)}` : ''}
              ORDER BY assigned_at DESC LIMIT 2000`;
       params.push(employeeId);
       if (provider) params.push(provider);
@@ -1093,57 +1099,61 @@ app.get('/employee/provider-summary', async (req, res) => {
       for (const p of EMAIL_PROVIDERS) o[p] = emptyOutcomes();
       return o;
     };
+    // Counts are broken down by category as well as provider, so a "Business Accepted" tab filtered
+    // to Google Workspace shows the count for exactly that combination.
+    const emptyTotals = () => ({ business: emptyProviders(), personal: emptyProviders() });
     const fill = (target: any, list: any[]) => {
       for (const r of list) {
+        const cat = String(r.category || '').toLowerCase();
         const p = String(r.provider || 'unknown').toLowerCase();
         const out = String(r.outcome || '').toLowerCase();
-        if (target[p] && target[p][out] !== undefined) target[p][out] += Number(r.c || 0);
+        if (target[cat] && target[cat][p] && target[cat][p][out] !== undefined) target[cat][p][out] += Number(r.c || 0);
       }
     };
 
     if (batchId) {
       const rows = await query(
-        `SELECT vr.provider, vr.outcome, COUNT(*) AS c
+        `SELECT vr.category, vr.provider, vr.outcome, COUNT(*) AS c
          FROM validation_results vr
          JOIN master_emails me ON vr.master_id = me.id
          WHERE me.batch_id = $1
-         GROUP BY vr.provider, vr.outcome`,
+         GROUP BY vr.category, vr.provider, vr.outcome`,
         [Number(batchId)]
       );
-      const batch = emptyProviders();
+      const batch = emptyTotals();
       fill(batch, rows.rows);
       return res.json({ batch });
     }
 
     const [ownRows, fpRows] = await Promise.all([
       query(
-        `SELECT provider, outcome, COUNT(*) AS c FROM (
-           SELECT fbe.provider, fbe.outcome
+        `SELECT category, provider, outcome, COUNT(*) AS c FROM (
+           SELECT 'business' AS category, fbe.provider, fbe.outcome
            FROM final_business_emails fbe
            JOIN batches b ON fbe.batch_id = b.batch_id
            WHERE b.submitter_uuid = $1 AND COALESCE(fbe.is_free_pool, false) = false
 
            UNION ALL
 
-           SELECT fpe.provider, fpe.outcome
+           SELECT 'personal' AS category, fpe.provider, fpe.outcome
            FROM final_personal_emails fpe
            JOIN batches b ON fpe.batch_id = b.batch_id
            WHERE b.submitter_uuid = $1 AND COALESCE(fpe.is_free_pool, false) = false
          ) t
-         GROUP BY provider, outcome`,
+         GROUP BY category, provider, outcome`,
         [employeeId]
       ),
       query(
-        `SELECT provider, outcome, COUNT(*) AS c
+        `SELECT category, provider, outcome, COUNT(*) AS c
          FROM free_pool
          WHERE assigned_to_uuid = $1 AND is_assigned = true AND COALESCE(is_downloaded, false) = false
-         GROUP BY provider, outcome`,
+         GROUP BY category, provider, outcome`,
         [employeeId]
       ),
     ]);
 
-    const own = emptyProviders();
-    const free_pool = emptyProviders();
+    const own = emptyTotals();
+    const free_pool = emptyTotals();
     fill(own, ownRows.rows);
     fill(free_pool, fpRows.rows);
     res.json({ own, free_pool });
@@ -1537,9 +1547,13 @@ app.get('/employee/validation/export-all', async (req, res) => {
 
 app.get('/employee/validation/export-category', async (req, res) => {
   try {
-    const { employee_id: employeeUuid, category, outcome, q, source: sourceRaw } = req.query;
+    const { employee_id: employeeUuid, category, outcome, q, source: sourceRaw, provider: providerRaw } = req.query;
     if (!employeeUuid || !category || !outcome) return res.status(400).send('missing_params');
     const source = String(sourceRaw || '').toLowerCase(); // 'own' | 'free_pool' | ''
+    // The export must honour the same provider filter as the on-screen table, otherwise the CSV
+    // silently contains rows the user did not select.
+    const providerFilter = String(providerRaw || '').toLowerCase();
+    if (providerFilter && !EMAIL_PROVIDERS.includes(providerFilter as any)) return res.status(400).send('invalid_provider');
 
     let sql = '';
     let params: any[] = [employeeUuid, String(category), String(outcome)];
@@ -1548,33 +1562,41 @@ app.get('/employee/validation/export-category', async (req, res) => {
       const cat = String(category);
       if (cat !== 'personal' && cat !== 'business') return res.status(400).send('invalid_category');
       const table = cat === 'personal' ? 'final_personal_emails' : 'final_business_emails';
-      sql = `SELECT f.email, f.domain,
+      params = [employeeUuid, String(outcome)];
+      const provClause = providerFilter ? ` AND ${providerSql('f.provider', params.length + 1, providerFilter)}` : '';
+      if (providerFilter) params.push(providerFilter);
+      sql = `SELECT f.email, f.domain, f.provider,
                     f.outcome AS status, '${cat}' AS category,
                     f.batch_id, vr.validated_at, 'validation' AS source, vr.id
              FROM ${table} f
              JOIN batches b ON f.batch_id = b.batch_id
              LEFT JOIN validation_results vr ON vr.master_id = f.master_id
-             WHERE b.submitter_uuid = $1 AND f.outcome = $2 AND COALESCE(f.is_free_pool, false) = false`;
-      params = [employeeUuid, String(outcome)];
+             WHERE b.submitter_uuid = $1 AND f.outcome = $2 AND COALESCE(f.is_free_pool, false) = false${provClause}`;
     } else if (source === 'free_pool') {
-      sql = `SELECT email, domain, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
+      const provClause = providerFilter ? ` AND ${providerSql('provider', params.length + 1, providerFilter)}` : '';
+      if (providerFilter) params.push(providerFilter);
+      sql = `SELECT email, domain, provider, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
              FROM free_pool
-             WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false`;
+             WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false${provClause}`;
     } else {
+      const provIdx = params.length + 1;
+      const provClauseVr = providerFilter ? ` AND ${providerSql('vr.provider', provIdx, providerFilter)}` : '';
+      const provClauseFp = providerFilter ? ` AND ${providerSql('provider', provIdx, providerFilter)}` : '';
+      if (providerFilter) params.push(providerFilter);
       sql = `
-        SELECT email, domain, status, category, batch_id, validated_at, source, id FROM (
-          SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain,
+        SELECT email, domain, provider, status, category, batch_id, validated_at, source, id FROM (
+          SELECT me.email_normalized AS email, COALESCE(vr.domain, me.domain) AS domain, vr.provider,
                  vr.outcome AS status, vr.category, me.batch_id, vr.validated_at, 'validation' AS source, vr.id
           FROM validation_results vr
           JOIN master_emails me ON vr.master_id = me.id
           JOIN batches b ON me.batch_id = b.batch_id
-          WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false
+          WHERE b.submitter_uuid = $1 AND vr.category = $2 AND vr.outcome = $3 AND COALESCE(vr.is_downloaded,false)=false${provClauseVr}
 
           UNION ALL
 
-          SELECT email, domain, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
+          SELECT email, domain, provider, outcome AS status, category, batch_id, assigned_at AS validated_at, 'free_pool' AS source, id
           FROM free_pool
-          WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false
+          WHERE assigned_to_uuid = $1 AND category = $2 AND outcome = $3 AND is_assigned = true AND COALESCE(is_downloaded,false)=false${provClauseFp}
         ) AS combined
       `;
     }
@@ -1588,6 +1610,7 @@ app.get('/employee/validation/export-category', async (req, res) => {
       id: number;
       email: string;
       domain: string | null;
+      provider: string | null;
       status: string;
       category: string;
       batch_id: number;
@@ -1600,9 +1623,9 @@ app.get('/employee/validation/export-category', async (req, res) => {
     const vIds = rows.rows.filter(r => r.source === 'validation' && r.id != null).map(r => r.id);
     const fpIds = rows.rows.filter(r => r.source === 'free_pool' && r.id != null).map(r => r.id);
 
-    const header = 'email,domain,status,category,batch_id,validated_at\n';
+    const header = 'email,domain,provider,status,category,batch_id,validated_at\n';
     const body = rows.rows.map(r => [
-      csvField(r.email), csvField(r.domain), csvField(r.status), csvField(r.category),
+      csvField(r.email), csvField(r.domain), csvField(r.provider), csvField(r.status), csvField(r.category),
       csvField(String(r.batch_id)),
       csvField(r.validated_at ? new Date(r.validated_at).toISOString() : '')
     ].join(',')).join('\n');
