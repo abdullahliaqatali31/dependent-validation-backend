@@ -20,6 +20,7 @@
     "unstick:batch": "ts-node-dev --transpile-only src/scripts/unstickBatch.ts",
     "test:ninja": "ts-node-dev --transpile-only src/scripts/testNinja.ts",
     "clean:jobs": "ts-node-dev --transpile-only src/scripts/clearFinishedJobs.ts",
+    "backfill:provider": "ts-node-dev --transpile-only src/scripts/backfillProvider.ts",
     "dev": "npm run api",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/api/index.js",

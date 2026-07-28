@@ -6,6 +6,7 @@ import { dedupeQueue, filterQueue } from '../queues';
 import { personalQueue, validationQueue, validationQueues, QUEUE_NAMES } from '../queues';
 import { publish, CHANNELS, redis } from '../redis';
 import { ensureBatchActivated, assignWorkerRoundRobin, releaseBatchAssignment } from '../utils/validationAssignment';
+import { EMAIL_PROVIDERS } from '../utils/emailProvider';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
@@ -427,7 +428,10 @@ app.get('/employee/results/by-category', async (req, res) => {
     const batchId = (req.query.batch_id || '').toString();
     const employeeId = (req.query.employee_id || '').toString();
     const source = String((req.query.source || '').toString()).toLowerCase(); // 'own' | 'free_pool' | '' (both)
+    const providerRaw = String((req.query.provider || '').toString()).toLowerCase();
     if (!['business','personal'].includes(category) || !['accepted','catch_all','rejected','timeout'].includes(outcome)) return res.status(400).json({ error: 'invalid_params' });
+    if (providerRaw && !EMAIL_PROVIDERS.includes(providerRaw as any)) return res.status(400).json({ error: 'invalid_provider' });
+    const provider = providerRaw || null;
     if (!batchId && !employeeId) return res.status(400).json({ error: 'missing_scope' });
 
     let sql = '';
@@ -440,8 +444,10 @@ app.get('/employee/results/by-category', async (req, res) => {
              FROM validation_results vr
              JOIN master_emails me ON vr.master_id=me.id
              WHERE vr.category=$1 AND vr.outcome=$2 AND COALESCE(vr.is_downloaded,false)=false AND me.batch_id=$3
+             ${provider ? 'AND vr.provider=$4' : ''}
              ORDER BY vr.validated_at DESC LIMIT 2000`;
       params.push(Number(batchId));
+      if (provider) params.push(provider);
     } else if (source === 'own') {
       // Use final tables with is_free_pool=false — guarantees no overlap with free pool section
       const table = category === 'personal' ? 'final_personal_emails' : 'final_business_emails';
@@ -454,14 +460,17 @@ app.get('/employee/results/by-category', async (req, res) => {
              WHERE b.submitter_uuid = $1
                AND f.outcome = $2
                AND COALESCE(f.is_free_pool, false) = false
+               ${provider ? 'AND f.provider = $3' : ''}
              ORDER BY f.id DESC LIMIT 2000`;
-      params = [employeeId, outcome];
+      params = provider ? [employeeId, outcome, provider] : [employeeId, outcome];
     } else if (source === 'free_pool') {
       sql = `SELECT email, NULL AS reason, NULL AS key
              FROM free_pool
              WHERE category=$1 AND outcome=$2 AND assigned_to_uuid=$3 AND is_assigned=true AND COALESCE(is_downloaded,false)=false
+             ${provider ? 'AND provider=$4' : ''}
              ORDER BY assigned_at DESC LIMIT 2000`;
       params.push(employeeId);
+      if (provider) params.push(provider);
     } else {
       // Legacy: no source filter — return both merged (backwards compat)
       sql = `
@@ -1066,6 +1075,80 @@ app.get('/employee/validation-summary', async (req, res) => {
     res.json({ own, free_pool });
   } catch (err: any) {
     res.status(500).json({ error: 'employee_validation_summary_failed', details: err.message });
+  }
+});
+
+// Provider identity breakdown (Google Workspace / Microsoft 365 / gateway / other / unknown).
+// Scoped by batch_id or employee_id, mirroring /employee/validation-summary's response shape so the
+// UI can render it with the same components as the category buckets.
+app.get('/employee/provider-summary', async (req, res) => {
+  try {
+    const employeeId = String((req.query.employee_id || '').toString());
+    const batchId = String((req.query.batch_id || '').toString());
+    if (!employeeId && !batchId) return res.status(400).json({ error: 'missing_scope' });
+
+    const emptyOutcomes = () => ({ accepted: 0, catch_all: 0, rejected: 0, timeout: 0 });
+    const emptyProviders = () => {
+      const o: any = {};
+      for (const p of EMAIL_PROVIDERS) o[p] = emptyOutcomes();
+      return o;
+    };
+    const fill = (target: any, list: any[]) => {
+      for (const r of list) {
+        const p = String(r.provider || 'unknown').toLowerCase();
+        const out = String(r.outcome || '').toLowerCase();
+        if (target[p] && target[p][out] !== undefined) target[p][out] += Number(r.c || 0);
+      }
+    };
+
+    if (batchId) {
+      const rows = await query(
+        `SELECT vr.provider, vr.outcome, COUNT(*) AS c
+         FROM validation_results vr
+         JOIN master_emails me ON vr.master_id = me.id
+         WHERE me.batch_id = $1
+         GROUP BY vr.provider, vr.outcome`,
+        [Number(batchId)]
+      );
+      const batch = emptyProviders();
+      fill(batch, rows.rows);
+      return res.json({ batch });
+    }
+
+    const [ownRows, fpRows] = await Promise.all([
+      query(
+        `SELECT provider, outcome, COUNT(*) AS c FROM (
+           SELECT fbe.provider, fbe.outcome
+           FROM final_business_emails fbe
+           JOIN batches b ON fbe.batch_id = b.batch_id
+           WHERE b.submitter_uuid = $1 AND COALESCE(fbe.is_free_pool, false) = false
+
+           UNION ALL
+
+           SELECT fpe.provider, fpe.outcome
+           FROM final_personal_emails fpe
+           JOIN batches b ON fpe.batch_id = b.batch_id
+           WHERE b.submitter_uuid = $1 AND COALESCE(fpe.is_free_pool, false) = false
+         ) t
+         GROUP BY provider, outcome`,
+        [employeeId]
+      ),
+      query(
+        `SELECT provider, outcome, COUNT(*) AS c
+         FROM free_pool
+         WHERE assigned_to_uuid = $1 AND is_assigned = true AND COALESCE(is_downloaded, false) = false
+         GROUP BY provider, outcome`,
+        [employeeId]
+      ),
+    ]);
+
+    const own = emptyProviders();
+    const free_pool = emptyProviders();
+    fill(own, ownRows.rows);
+    fill(free_pool, fpRows.rows);
+    res.json({ own, free_pool });
+  } catch (err: any) {
+    res.status(500).json({ error: 'employee_provider_summary_failed', details: err.message });
   }
 });
 
@@ -2347,8 +2430,8 @@ app.post('/free-pool/assign', async (req, res) => {
       }
       async function take(category: string, outcome: string, n: number) {
         if (n <= 0) return [] as any[];
-        const r = await client.query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-          `SELECT id, email, domain, category, outcome
+        const r = await client.query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null; provider: string | null }>(
+          `SELECT id, email, domain, category, outcome, provider
            FROM free_pool
            WHERE is_assigned=false AND category=$1 AND outcome=$2
            ORDER BY id ASC
@@ -2372,8 +2455,8 @@ app.post('/free-pool/assign', async (req, res) => {
       } else {
         // Fallback: prefer ONLY 'accepted' unless not enough exist.
         // If the user wants catch-all, they should specify it in the 'request' object.
-        const anyQ = await client.query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null }>(
-          `SELECT id, email, domain, category, outcome
+        const anyQ = await client.query<{ id: number; email: string; domain: string | null; category: string | null; outcome: string | null; provider: string | null }>(
+          `SELECT id, email, domain, category, outcome, provider
            FROM free_pool
            WHERE is_assigned=false AND outcome = 'accepted'
            ORDER BY id ASC
@@ -2393,10 +2476,11 @@ app.post('/free-pool/assign', async (req, res) => {
         const email = String(r.email || '').trim();
         const domain = r.domain || null;
         const outcome = ['accepted','catch_all','rejected','timeout'].includes(String(r.outcome || '')) ? String(r.outcome) : 'accepted';
+        const provider = r.provider || 'unknown';
         if (String(r.category || '') === 'personal') {
-          await client.query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
+          await client.query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool, provider) VALUES (NULL, NULL, $1, $2, $3, true, true, $4)', [email, domain, outcome, provider]);
         } else {
-          await client.query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool) VALUES (NULL, NULL, $1, $2, $3, true, true)', [email, domain, outcome]);
+          await client.query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, assigned_from_free_pool, is_free_pool, provider) VALUES (NULL, NULL, $1, $2, $3, true, true, $4)', [email, domain, outcome, provider]);
         }
       }
       await client.query('INSERT INTO free_pool_assignments(employee_uuid, business_accepted, business_catch_all, personal_accepted, personal_catch_all, total) VALUES ($1, $2, $3, $4, $5, $6)', [employeeId, rBizAcc, rBizCat, rPerAcc, rPerCat, limit]);

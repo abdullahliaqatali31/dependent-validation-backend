@@ -23,10 +23,18 @@ async function processMaster(masterId: number) {
     await publish(CHANNELS.batchProgress, { batchId: batch_id, stage: 'personal', status: 'paused', master_id: masterId });
     return;
   }
-  const vr = await query<{ outcome: string | null; category: string | null }>('SELECT outcome, category FROM validation_results WHERE master_id=$1 ORDER BY validated_at DESC LIMIT 1', [masterId]);
+  const vr = await query<{ outcome: string | null; category: string | null; provider: string | null }>('SELECT outcome, category, provider FROM validation_results WHERE master_id=$1 ORDER BY validated_at DESC LIMIT 1', [masterId]);
   if (vr.rows.length === 0) return;
   const outcome = String(vr.rows[0].outcome || '').toLowerCase();
   let category = String(vr.rows[0].category || '').toLowerCase();
+
+  // Error/timeout rows never got an mx, so fall back to the domain-level cache before giving up.
+  let provider = vr.rows[0].provider || null;
+  if (!provider && domain) {
+    const dp = await query<{ provider: string }>('SELECT provider FROM domain_provider WHERE domain=$1', [String(domain).toLowerCase()]);
+    provider = dp.rows[0]?.provider || null;
+  }
+  provider = provider || 'unknown';
 
   const isPublic = await isPublicDomain(domain);
   if (isPublic) {
@@ -40,14 +48,14 @@ async function processMaster(masterId: number) {
   const emailQ = await query<{ email_normalized: string }>('SELECT email_normalized FROM master_emails WHERE id=$1', [masterId]);
   const email = emailQ.rows[0]?.email_normalized || '';
   if (category === 'personal') {
-    await query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, is_free_pool) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4 FROM master_emails me WHERE me.id=$3 ON CONFLICT (master_id) DO NOTHING', [batch_id, outcome, masterId, isCollector]);
+    await query('INSERT INTO final_personal_emails(batch_id, master_id, email, domain, outcome, is_free_pool, provider) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4, $5 FROM master_emails me WHERE me.id=$3 ON CONFLICT (master_id) DO NOTHING', [batch_id, outcome, masterId, isCollector, provider]);
   } else {
-    await query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, is_free_pool) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4 FROM master_emails me WHERE me.id=$3 ON CONFLICT (master_id) DO NOTHING', [batch_id, outcome, masterId, isCollector]);
+    await query('INSERT INTO final_business_emails(batch_id, master_id, email, domain, outcome, is_free_pool, provider) SELECT $1, me.id, me.email_normalized, me.domain, $2, $4, $5 FROM master_emails me WHERE me.id=$3 ON CONFLICT (master_id) DO NOTHING', [batch_id, outcome, masterId, isCollector, provider]);
   }
   if (isCollector) {
     await query(
-      'INSERT INTO free_pool(email, domain, category, outcome, metadata, is_assigned, is_free_pool, batch_id) VALUES ($1, $2, $3, $4, $5, false, true, $6) ON CONFLICT (email) DO NOTHING',
-      [email, domain, category, outcome, JSON.stringify({ master_id: masterId }), batch_id]
+      'INSERT INTO free_pool(email, domain, category, outcome, metadata, is_assigned, is_free_pool, batch_id, provider) VALUES ($1, $2, $3, $4, $5, false, true, $6, $7) ON CONFLICT (email) DO NOTHING',
+      [email, domain, category, outcome, JSON.stringify({ master_id: masterId }), batch_id, provider]
     );
   }
   try {

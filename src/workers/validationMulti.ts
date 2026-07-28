@@ -5,6 +5,7 @@ import { query } from '../db'
 import { redis, publish, CHANNELS } from '../redis'
 import { QUEUE_NAMES, personalQueue, validationQueues } from '../queues'
 import { releaseBatchAssignment, ensureBatchActivated, assignWorkerRoundRobin, refreshActiveBatch } from '../utils/validationAssignment'
+import { providerFromMx, primaryMxHost } from '../utils/emailProvider'
 
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
 
@@ -125,11 +126,23 @@ async function processJob(masterId: number, key: string, workerId: string, worke
     const isPersonalDB = await query<{ count: string }>('SELECT COUNT(*) FROM public_provider_domains WHERE domain=$1', [domain || ''])
     const isPersonal = (DEFAULT_PUBLIC_DOMAINS.has((domain || '').toLowerCase())) || (Number(isPersonalDB.rows[0]?.count || 0) > 0)
     const category = isPersonal ? 'personal' : 'business'
+    // Provider identity is a domain-level fact; cache it so every row for this domain agrees and so
+    // the split stage can reuse it without re-deriving from mx.
+    const provider = providerFromMx(mx)
+    if (domain) {
+      await query(
+        `INSERT INTO domain_provider(domain, provider, mx_host, source, checked_at, updated_at)
+         VALUES ($1, $2, $3, 'validation_mx', now(), now())
+         ON CONFLICT (domain) DO UPDATE
+           SET provider = EXCLUDED.provider, mx_host = EXCLUDED.mx_host, source = EXCLUDED.source, updated_at = now()`,
+        [String(domain).toLowerCase(), provider, primaryMxHost(mx)]
+      ).catch(() => {})
+    }
     await query(
-      `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO validation_results(master_id, status_enum, details, ninja_key_used, domain, mx, message, metadata, category, outcome, is_personal, is_business, provider)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        ON CONFLICT (master_id) DO NOTHING`,
-      [masterId, status, JSON.stringify(data), key, domain, mx, message, JSON.stringify({ domain, mx, code }), category, outcome, isPersonal, !isPersonal]
+      [masterId, status, JSON.stringify(data), key, domain, mx, message, JSON.stringify({ domain, mx, code }), category, outcome, isPersonal, !isPersonal, provider]
     )
     await query(
       `UPDATE ninja_keys
