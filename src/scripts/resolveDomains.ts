@@ -111,12 +111,24 @@ async function persist(outcomes: Outcome[], source: string) {
   );
 }
 
-/** Domains anywhere in the database that still have no usable identity. */
+/**
+ * Domains anywhere in the database that still have no usable identity.
+ *
+ * The page of distinct domains and the "does this one need work" flag come from a single query, so
+ * the cursor always advances by the full page even when every row in it was filtered out. Deriving
+ * the cursor separately would be wrong: master_emails holds many rows per domain, so an offset into
+ * the non-distinct table advances far slower than a page of distinct domains and the scan would
+ * revisit the same domains forever.
+ */
 async function* outstandingDomains() {
   let cursor = '';
   for (;;) {
-    const r = await query<{ domain: string }>(
-      `SELECT d.domain FROM (
+    const page = await query<{ domain: string; needs: boolean }>(
+      `SELECT d.domain,
+              (dp.domain IS NULL
+                 OR dp.provider = 'unknown'
+                 OR ($3 > 0 AND dp.checked_at < now() - ($3 || ' days')::interval)) AS needs
+       FROM (
          SELECT DISTINCT lower(domain) AS domain
          FROM master_emails
          WHERE domain IS NOT NULL AND domain <> '' AND lower(domain) > $1
@@ -124,23 +136,13 @@ async function* outstandingDomains() {
          LIMIT $2
        ) d
        LEFT JOIN domain_provider dp ON dp.domain = d.domain
-       WHERE dp.domain IS NULL
-          OR dp.provider = 'unknown'
-          OR ($3 > 0 AND dp.checked_at < now() - ($3 || ' days')::interval)
        ORDER BY d.domain`,
       [cursor, PAGE, STALE_DAYS]
     );
-    // The page is taken from master_emails before the join filter, so advance the cursor using the
-    // widest domain scanned, not the widest returned — otherwise filtered pages would loop forever.
-    const scanned = await query<{ domain: string }>(
-      `SELECT lower(domain) AS domain FROM master_emails
-       WHERE domain IS NOT NULL AND domain <> '' AND lower(domain) > $1
-       ORDER BY lower(domain) LIMIT 1 OFFSET $2`,
-      [cursor, PAGE - 1]
-    );
-    if (r.rows.length > 0) yield r.rows.map(x => x.domain);
-    if (scanned.rows.length === 0) return;
-    cursor = scanned.rows[0].domain;
+    if (page.rows.length === 0) return;
+    const needed = page.rows.filter(r => r.needs).map(r => r.domain);
+    if (needed.length > 0) yield needed;
+    cursor = page.rows[page.rows.length - 1].domain;
   }
 }
 
