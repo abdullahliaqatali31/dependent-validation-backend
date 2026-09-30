@@ -7,6 +7,8 @@ import { personalQueue, validationQueue, validationQueues, QUEUE_NAMES } from '.
 import { publish, CHANNELS, redis } from '../redis';
 import { ensureBatchActivated, assignWorkerRoundRobin, releaseBatchAssignment } from '../utils/validationAssignment';
 import { EMAIL_PROVIDERS } from '../utils/emailProvider';
+import { bumpUnsubscribeVersion } from '../utils/unsubscribeFilter';
+import { DEFAULT_PUBLIC_DOMAINS } from '../workers/common';
 import { createClient } from '@supabase/supabase-js';
 
 // Rows written before the provider backfill have provider IS NULL, and the summary endpoints count
@@ -2148,11 +2150,58 @@ app.post('/admin/control/:action', async (req, res) => {
 });
 
 // Admin: unsubscribes
+const UNSUB_MAX_BATCH = 5000;
+const PUBLIC_DOMAIN_LIST = [...DEFAULT_PUBLIC_DOMAINS];
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const DOMAIN_RE = /^(?:[a-z0-9-]{1,63}\.)+[a-z]{2,}$/;
+
+function pageParams(req: express.Request) {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 500);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  return { limit, offset };
+}
+
+// Shared WHERE builder: free-text search + "added by" filter ('none' = no recorded adder)
+function unsubFilters(req: express.Request, col: 'email' | 'domain', alias: string) {
+  const where: string[] = [];
+  const params: any[] = [];
+  const q = String(req.query.q || '').trim();
+  if (q) {
+    params.push(`%${escapeLike(q)}%`);
+    const p = `$${params.length}`;
+    where.push(col === 'email'
+      ? `(${alias}.email ILIKE ${p} OR ${alias}.reason ILIKE ${p} OR ${alias}.campaign ILIKE ${p} OR p.email ILIKE ${p} OR p.full_name ILIKE ${p})`
+      : `(${alias}.domain ILIKE ${p} OR p.email ILIKE ${p} OR p.full_name ILIKE ${p})`);
+  }
+  const addedBy = String(req.query.added_by || '').trim();
+  if (addedBy === 'none') where.push(`${alias}.added_by_uuid IS NULL`);
+  else if (addedBy) { params.push(addedBy); where.push(`${alias}.added_by_uuid::text = $${params.length}`); }
+  return { where, params };
+}
+
+async function logUnsubAdmin(action: string, actorUuid: string, details: Record<string, unknown>) {
+  await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)',
+    [action, null, JSON.stringify({ actor_uuid: actorUuid, ...details })]);
+}
+
 app.get('/admin/unsubscribes/emails', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
   try {
-    const rows = await query('SELECT * FROM unsubscribe_list ORDER BY added_at DESC');
-    res.json(rows.rows);
+    const { limit, offset } = pageParams(req);
+    const { where, params } = unsubFilters(req, 'email', 'u');
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const from = `FROM unsubscribe_list u LEFT JOIN profiles p ON p.id::text = u.added_by_uuid::text ${whereSql}`;
+    const [rows, total] = await Promise.all([
+      query(
+        `SELECT u.email, u.reason, u.campaign, u.added_at, u.added_by_uuid::text AS added_by_uuid,
+                p.email AS added_by_email, p.full_name AS added_by_name
+         ${from} ORDER BY u.added_at DESC NULLS LAST, u.email
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]
+      ),
+      query<{ n: string }>(`SELECT COUNT(*)::text AS n ${from}`, params),
+    ]);
+    res.json({ rows: rows.rows, total: Number(total.rows[0]?.n || 0) });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_unsub_emails_list_failed', details: err.message });
   }
@@ -2161,10 +2210,217 @@ app.get('/admin/unsubscribes/emails', async (req, res) => {
 app.get('/admin/unsubscribes/domains', async (req, res) => {
   if (!await requireAdmin(req, res)) return;
   try {
-    const rows = await query('SELECT * FROM unsubscribe_domains ORDER BY added_at DESC');
-    res.json(rows.rows);
+    const { limit, offset } = pageParams(req);
+    const { where, params } = unsubFilters(req, 'domain', 'd');
+    params.push(PUBLIC_DOMAIN_LIST);
+    const pubParam = `$${params.length}`;
+    const isPublic = `(pp.domain IS NOT NULL OR lower(d.domain) = ANY(${pubParam}::text[]))`;
+    const publicOnly = String(req.query.public_only || '') === '1';
+    if (publicOnly) where.push(isPublic);
+    // The count query only references the public-list param when filtering on it; Postgres
+    // rejects an unreferenced param, and it is last, so dropping it keeps the numbering intact.
+    const countParams = publicOnly ? params : params.slice(0, -1);
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const from = `FROM unsubscribe_domains d
+      LEFT JOIN profiles p ON p.id::text = d.added_by_uuid::text
+      LEFT JOIN public_provider_domains pp ON lower(pp.domain) = lower(d.domain)
+      ${whereSql}`;
+    const [rows, total, pub] = await Promise.all([
+      query(
+        `SELECT d.domain, d.added_at, d.added_by_uuid::text AS added_by_uuid,
+                p.email AS added_by_email, p.full_name AS added_by_name,
+                ${isPublic} AS is_public_provider
+         ${from} ORDER BY d.added_at DESC NULLS LAST, d.domain
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]
+      ),
+      query<{ n: string }>(`SELECT COUNT(*)::text AS n ${from}`, countParams),
+      // Unfiltered: how many public-provider domains are blocking mail right now
+      query<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM unsubscribe_domains d
+         LEFT JOIN public_provider_domains pp ON lower(pp.domain) = lower(d.domain)
+         WHERE pp.domain IS NOT NULL OR lower(d.domain) = ANY($1::text[])`,
+        [PUBLIC_DOMAIN_LIST]
+      ),
+    ]);
+    res.json({ rows: rows.rows, total: Number(total.rows[0]?.n || 0), public_count: Number(pub.rows[0]?.n || 0) });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_unsub_domains_list_failed', details: err.message });
+  }
+});
+
+// Everyone who has added an unsubscribe entry, for the "Added by" filter
+app.get('/admin/unsubscribes/contributors', async (req, res) => {
+  if (!await requireAdmin(req, res)) return;
+  try {
+    const rows = await query(
+      `SELECT t.uuid AS id, p.email, p.full_name,
+              SUM(t.emails)::int AS emails, SUM(t.domains)::int AS domains
+       FROM (
+         SELECT added_by_uuid::text AS uuid, COUNT(*) AS emails, 0 AS domains FROM unsubscribe_list
+          WHERE added_by_uuid IS NOT NULL GROUP BY 1
+         UNION ALL
+         SELECT added_by_uuid::text, 0, COUNT(*) FROM unsubscribe_domains
+          WHERE added_by_uuid IS NOT NULL GROUP BY 1
+       ) t
+       LEFT JOIN profiles p ON p.id::text = t.uuid
+       GROUP BY t.uuid, p.email, p.full_name
+       ORDER BY COALESCE(p.full_name, p.email, t.uuid)`
+    );
+    res.json(rows.rows);
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_unsub_contributors_failed', details: err.message });
+  }
+});
+
+// Edit one email entry: fix the address and/or its reason/campaign
+app.put('/admin/unsubscribes/emails', async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  try {
+    const { email, new_email, reason, campaign } = req.body || {};
+    const original = String(email || '');
+    if (!original) return res.status(400).json({ error: 'email_required' });
+    const next = String(new_email ?? original).trim().toLowerCase();
+    if (!EMAIL_RE.test(next)) return res.status(400).json({ error: 'invalid_email' });
+    const r = await query(
+      `UPDATE unsubscribe_list SET email=$2, reason=$3, campaign=$4 WHERE email=$1
+       RETURNING email, reason, campaign, added_at, added_by_uuid::text AS added_by_uuid`,
+      [original, next, reason || null, campaign || null]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    await logUnsubAdmin('admin_unsub_email_edit', admin.id, { from: original, to: next });
+    await bumpUnsubscribeVersion();
+    res.json(r.rows[0]);
+  } catch (err: any) {
+    if (err?.code === '23505') return res.status(409).json({ error: 'email_already_in_list' });
+    res.status(500).json({ error: 'admin_unsub_email_edit_failed', details: err.message });
+  }
+});
+
+app.put('/admin/unsubscribes/domains', async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  try {
+    const { domain, new_domain } = req.body || {};
+    const original = String(domain || '');
+    if (!original) return res.status(400).json({ error: 'domain_required' });
+    const next = String(new_domain || '').trim().toLowerCase();
+    if (!DOMAIN_RE.test(next)) return res.status(400).json({ error: 'invalid_domain' });
+    const r = await query(
+      `UPDATE unsubscribe_domains SET domain=$2 WHERE domain=$1
+       RETURNING domain, added_at, added_by_uuid::text AS added_by_uuid`,
+      [original, next]
+    );
+    if (r.rows.length === 0) return res.status(404).json({ error: 'not_found' });
+    await logUnsubAdmin('admin_unsub_domain_edit', admin.id, { from: original, to: next });
+    await bumpUnsubscribeVersion();
+    res.json(r.rows[0]);
+  } catch (err: any) {
+    if (err?.code === '23505') return res.status(409).json({ error: 'domain_already_in_list' });
+    res.status(500).json({ error: 'admin_unsub_domain_edit_failed', details: err.message });
+  }
+});
+
+// Delete entries. Returns the full deleted rows so the UI can offer Undo (restore endpoints below).
+app.delete('/admin/unsubscribes/emails', async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  try {
+    const list: string[] = Array.isArray(req.body?.emails) ? req.body.emails.map(String) : [];
+    if (list.length === 0) return res.status(400).json({ error: 'emails_required' });
+    if (list.length > UNSUB_MAX_BATCH) return res.status(400).json({ error: 'too_many', max: UNSUB_MAX_BATCH });
+    const r = await query(
+      `DELETE FROM unsubscribe_list WHERE email = ANY($1::text[])
+       RETURNING email, reason, campaign, added_by, added_by_uuid::text AS added_by_uuid, added_at`,
+      [list]
+    );
+    await logUnsubAdmin('admin_unsub_emails_delete', admin.id, { count: r.rows.length, emails: r.rows.map((x: any) => x.email) });
+    await bumpUnsubscribeVersion();
+    res.json({ deleted: r.rows });
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_unsub_emails_delete_failed', details: err.message });
+  }
+});
+
+// Body: { domains: [...] } or { all_public: true } to purge every public-provider domain (gmail.com etc.)
+app.delete('/admin/unsubscribes/domains', async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  try {
+    let r;
+    if (req.body?.all_public === true) {
+      r = await query(
+        `DELETE FROM unsubscribe_domains d
+         WHERE lower(d.domain) = ANY($1::text[])
+            OR EXISTS (SELECT 1 FROM public_provider_domains pp WHERE lower(pp.domain) = lower(d.domain))
+         RETURNING d.domain, d.added_by, d.added_by_uuid::text AS added_by_uuid, d.added_at`,
+        [PUBLIC_DOMAIN_LIST]
+      );
+    } else {
+      const list: string[] = Array.isArray(req.body?.domains) ? req.body.domains.map(String) : [];
+      if (list.length === 0) return res.status(400).json({ error: 'domains_required' });
+      if (list.length > UNSUB_MAX_BATCH) return res.status(400).json({ error: 'too_many', max: UNSUB_MAX_BATCH });
+      r = await query(
+        `DELETE FROM unsubscribe_domains WHERE domain = ANY($1::text[])
+         RETURNING domain, added_by, added_by_uuid::text AS added_by_uuid, added_at`,
+        [list]
+      );
+    }
+    await logUnsubAdmin('admin_unsub_domains_delete', admin.id, { count: r.rows.length, domains: r.rows.map((x: any) => x.domain) });
+    await bumpUnsubscribeVersion();
+    res.json({ deleted: r.rows });
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_unsub_domains_delete_failed', details: err.message });
+  }
+});
+
+// Undo: re-insert rows exactly as the delete returned them (original adder + timestamp kept)
+app.post('/admin/unsubscribes/emails/restore', async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (rows.length === 0) return res.status(400).json({ error: 'rows_required' });
+    if (rows.length > UNSUB_MAX_BATCH) return res.status(400).json({ error: 'too_many', max: UNSUB_MAX_BATCH });
+    const r = await query(
+      `INSERT INTO unsubscribe_list(email, reason, campaign, added_by, added_by_uuid, added_at)
+       SELECT x.email, x.reason, x.campaign, x.added_by, x.added_by_uuid::uuid, COALESCE(x.added_at, now())
+       FROM jsonb_to_recordset($1::jsonb) AS x(email text, reason text, campaign text, added_by bigint, added_by_uuid text, added_at timestamptz)
+       WHERE x.email IS NOT NULL
+       ON CONFLICT (email) DO NOTHING
+       RETURNING email`,
+      [JSON.stringify(rows)]
+    );
+    await logUnsubAdmin('admin_unsub_emails_restore', admin.id, { count: r.rows.length });
+    await bumpUnsubscribeVersion();
+    res.json({ restored: r.rows.length });
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_unsub_emails_restore_failed', details: err.message });
+  }
+});
+
+app.post('/admin/unsubscribes/domains/restore', async (req, res) => {
+  const admin = await requireAdmin(req, res);
+  if (!admin) return;
+  try {
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (rows.length === 0) return res.status(400).json({ error: 'rows_required' });
+    if (rows.length > UNSUB_MAX_BATCH) return res.status(400).json({ error: 'too_many', max: UNSUB_MAX_BATCH });
+    const r = await query(
+      `INSERT INTO unsubscribe_domains(domain, added_by, added_by_uuid, added_at)
+       SELECT x.domain, x.added_by, x.added_by_uuid::uuid, COALESCE(x.added_at, now())
+       FROM jsonb_to_recordset($1::jsonb) AS x(domain text, added_by bigint, added_by_uuid text, added_at timestamptz)
+       WHERE x.domain IS NOT NULL
+       ON CONFLICT (domain) DO NOTHING
+       RETURNING domain`,
+      [JSON.stringify(rows)]
+    );
+    await logUnsubAdmin('admin_unsub_domains_restore', admin.id, { count: r.rows.length });
+    await bumpUnsubscribeVersion();
+    res.json({ restored: r.rows.length });
+  } catch (err: any) {
+    res.status(500).json({ error: 'admin_unsub_domains_restore_failed', details: err.message });
   }
 });
 
@@ -2178,6 +2434,7 @@ app.post('/admin/unsubscribes/emails', async (req, res) => {
     const values = emails.map((_, i) => `($${i + 1}, $${emails.length + 1})`).join(',');
     await query(`INSERT INTO unsubscribe_list(email, added_by) VALUES ${values} ON CONFLICT (email) DO NOTHING`, [...emails, userId]);
     await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['unsub_emails_upload', null, JSON.stringify({ count: emails.length })]);
+    await bumpUnsubscribeVersion();
     res.json({ inserted: emails.length });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_unsub_emails_upload_failed', details: err.message });
@@ -2194,6 +2451,7 @@ app.post('/admin/unsubscribes/domains', async (req, res) => {
     const values = domains.map((_, i) => `($${i + 1}, $${domains.length + 1})`).join(',');
     await query(`INSERT INTO unsubscribe_domains(domain, added_by) VALUES ${values} ON CONFLICT (domain) DO NOTHING`, [...domains, userId]);
     await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['unsub_domains_upload', null, JSON.stringify({ count: domains.length })]);
+    await bumpUnsubscribeVersion();
     res.json({ inserted: domains.length });
   } catch (err: any) {
     res.status(500).json({ error: 'admin_unsub_domains_upload_failed', details: err.message });
@@ -2228,6 +2486,7 @@ app.post('/employee/unsubscribes/emails', async (req, res) => {
     }
 
     await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['employee_unsub_emails', null, JSON.stringify({ employee_uuid: employeeUuid, count: list.length })]);
+    await bumpUnsubscribeVersion();
     res.json({ inserted: list.length });
   } catch (err: any) {
     console.error(err);
@@ -2259,6 +2518,7 @@ app.post('/employee/unsubscribes/domains', async (req, res) => {
       [...list, employeeUuid || null]
     );
     await query('INSERT INTO audit_logs(action_type, actor_id, details) VALUES ($1, $2, $3)', ['employee_unsub_domains', null, JSON.stringify({ employee_uuid: employeeUuid, count: list.length })]);
+    await bumpUnsubscribeVersion();
     res.json({ inserted: list.length });
   } catch (err: any) {
     console.error(err);

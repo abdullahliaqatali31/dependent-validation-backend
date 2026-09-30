@@ -1,5 +1,7 @@
 import { isUnsubscribed, isUnsubscribedEmail, isUnsubscribedDomain } from '../src/utils/unsubscribeFilter';
 
+jest.mock('../src/redis', () => ({ redis: { get: async () => null, incr: async () => 1 } }));
+
 jest.mock('../src/db', () => ({
   query: async (sql: string, params: any[]) => {
     const email = params[0];
